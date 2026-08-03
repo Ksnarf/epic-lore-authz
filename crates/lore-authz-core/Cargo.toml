@@ -1,0 +1,16 @@
+[package]
+name = "lore-authz-core"
+description = "Domain types and I/O-free traits for epic-lore-authz: claim shapes, principals, policy model, and the token-minting trait boundary. No database, no network, no crypto here."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_with = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }

@@ -1,0 +1,59 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/lore-authz-proto",
+    "crates/lore-authz-core",
+    "crates/lore-authz-server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/Ksnarf/epic-lore-authz"
+publish = false
+
+# Versions below are pinned to match github.com/EpicGames/lore at commit
+# f205899adf24b13b2d28e5c08d9256ac99c69f0c (see proto/vendor/UPSTREAM.md),
+# specifically its root Cargo.toml [workspace.dependencies]. jsonwebtoken is
+# the most important pin: lore-server validates tokens with jsonwebtoken
+# 9.3.1, and minting with a different version risks subtle interop bugs in
+# JWK alg/kid handling, the `aud` OneOrMany shape, and EC curve encoding.
+[workspace.dependencies]
+lore-authz-core = { path = "crates/lore-authz-core" }
+lore-authz-proto = { path = "crates/lore-authz-proto" }
+
+tonic = { version = "0.14.2", default-features = false, features = ["codegen", "router", "server", "transport", "tls-native-roots"] }
+tonic-prost = "0.14.2"
+tonic-prost-build = "0.14.2"
+prost = "0.14.1"
+prost-types = "0.14.1"
+
+jsonwebtoken = "9.3.1"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.143"
+serde_with = { version = "3.14.0", features = ["macros"] }
+
+axum = "0.8.4"
+tower = "0.5.2"
+tower-http = { version = "0.6.11", features = ["trace"] }
+
+tokio = { version = "1.47.1", features = ["rt-multi-thread", "macros", "signal", "net", "fs", "sync", "time"] }
+tokio-stream = "0.1.17"
+
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "rustls", "postgres", "uuid", "chrono", "migrate", "json"] }
+
+thiserror = "2.0.16"
+anyhow = "1.0.103"
+uuid = { version = "1.18.1", features = ["v4", "v7", "serde"] }
+chrono = { version = "0.4.42", default-features = false, features = ["alloc", "clock", "serde"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter", "json"] }
+async-trait = "0.1.89"
+
+# Profile choices intentionally mirror upstream lore's shape (fast local
+# builds by default, an explicit LTO profile for release artifacts) without
+# copying upstream's debug-symbol-splitting or quinn-specific overrides,
+# neither of which apply to this project.
+[profile.release]
+opt-level = 3

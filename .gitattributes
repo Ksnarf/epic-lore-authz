@@ -1,0 +1,5 @@
+# Shell scripts must stay LF. A CRLF entrypoint.sh in a Linux container boots
+# as `env: 'bash\r'` (exit 127) -- this bit a sibling project hard enough
+# that it is now a standing rule. See docs/architecture.md.
+*.sh eol=lf
+* text=auto eol=lf

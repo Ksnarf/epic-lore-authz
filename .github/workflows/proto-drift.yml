@@ -1,0 +1,86 @@
+name: proto-drift
+
+# Guards the single most important risk in this project (see
+# docs/protocol-notes.md and the design plan's "CLAIM-SHAPE DRIFT" risk):
+# this repo implements a contract it does not own, whose reference server
+# implementation is not open source. If our vendored proto copies drift from
+# what they were pinned against, or upstream quietly moves the contract, we
+# want to know loudly rather than discover it in a customer's cluster.
+
+on:
+  schedule:
+    - cron: "17 6 * * *" # daily, arbitrary off-the-hour time
+  workflow_dispatch: {}
+  pull_request:
+    paths:
+      - "proto/vendor/**"
+
+env:
+  UPSTREAM_REPO: EpicGames/lore
+  PINNED_COMMIT: f205899adf24b13b2d28e5c08d9256ac99c69f0c
+  UPSTREAM_PROTO_PATH: lore-proto/proto
+
+jobs:
+  check-pinned-commit:
+    runs-on: ubuntu-latest
+    # FAILS LOUDLY: our vendored copy no longer matches what SHA256SUMS says
+    # it was vendored from at the pinned commit. This should only happen if
+    # someone edited the vendored file locally without updating the pin --
+    # treat it as a bug, not as upstream drift.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch auth_api.proto and rebac_api.proto at pinned commit
+        run: |
+          mkdir -p /tmp/upstream-pinned
+          curl -fsSL -o /tmp/upstream-pinned/auth_api.proto \
+            "https://raw.githubusercontent.com/${UPSTREAM_REPO}/${PINNED_COMMIT}/${UPSTREAM_PROTO_PATH}/auth_api.proto"
+          curl -fsSL -o /tmp/upstream-pinned/rebac_api.proto \
+            "https://raw.githubusercontent.com/${UPSTREAM_REPO}/${PINNED_COMMIT}/${UPSTREAM_PROTO_PATH}/rebac_api.proto"
+
+      - name: Diff against our vendored copy
+        run: |
+          set -e
+          fail=0
+          for f in auth_api.proto rebac_api.proto; do
+            if ! diff -u "proto/vendor/$f" "/tmp/upstream-pinned/$f"; then
+              echo "::error::proto/vendor/$f no longer matches upstream at the pinned commit ${PINNED_COMMIT}"
+              fail=1
+            fi
+          done
+          exit $fail
+
+      - name: Verify SHA256SUMS
+        run: |
+          cd proto/vendor
+          sha256sum -c SHA256SUMS
+
+  check-upstream-main-drift:
+    runs-on: ubuntu-latest
+    # WARNS (never fails): tells us upstream main has moved so a human can
+    # decide whether to re-vendor and re-pin. Proto3 additive changes are
+    # safe to absorb; field renumbering or removal is not (see design plan
+    # section F risk #1).
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch auth_api.proto and rebac_api.proto at upstream main
+        run: |
+          mkdir -p /tmp/upstream-main
+          curl -fsSL -o /tmp/upstream-main/auth_api.proto \
+            "https://raw.githubusercontent.com/${UPSTREAM_REPO}/main/${UPSTREAM_PROTO_PATH}/auth_api.proto"
+          curl -fsSL -o /tmp/upstream-main/rebac_api.proto \
+            "https://raw.githubusercontent.com/${UPSTREAM_REPO}/main/${UPSTREAM_PROTO_PATH}/rebac_api.proto"
+
+      - name: Diff against our pinned vendored copy (warn only)
+        run: |
+          drifted=0
+          for f in auth_api.proto rebac_api.proto; do
+            if ! diff -u "proto/vendor/$f" "/tmp/upstream-main/$f"; then
+              echo "::warning::upstream main's $f has moved since our pinned commit ${PINNED_COMMIT}. Review before re-vendoring."
+              drifted=1
+            fi
+          done
+          if [ "$drifted" -eq 1 ]; then
+            echo "Upstream main has drifted from the pinned commit. This is a warning, not a failure."
+          fi

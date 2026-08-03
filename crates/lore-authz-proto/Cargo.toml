@@ -1,0 +1,16 @@
+[package]
+name = "lore-authz-proto"
+description = "Generated gRPC SERVER stubs for the vendored lore auth_api.proto and rebac_api.proto. Upstream lore-proto compiles these with .build_server(false); this crate is the one place in the project that flips it to true."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+prost = { workspace = true }
+prost-types = { workspace = true }
+tonic = { workspace = true }
+tonic-prost = { workspace = true }
+
+[build-dependencies]
+tonic-prost-build = { workspace = true }
