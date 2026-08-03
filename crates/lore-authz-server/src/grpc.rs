@@ -135,7 +135,9 @@ impl epic_urc::urc_auth_api_server::UrcAuthApi for AuthApiService {
         &self,
         _request: Request<epic_urc::GetUserInfoRequest>,
     ) -> Result<Response<epic_urc::GetUserInfoResponse>, Status> {
-        Err(Status::unimplemented("get_user_info: Phase 1 (see tasks.md)"))
+        Err(Status::unimplemented(
+            "get_user_info: Phase 1 (see tasks.md)",
+        ))
     }
 
     // P1, Phase 1.

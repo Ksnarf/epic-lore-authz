@@ -29,7 +29,9 @@ pub enum AuthzError {
     #[error("identity provider error: {0}")]
     IdpError(String),
 
-    #[error("this operation is not implemented (see comment at the call site for the phase that fills it in)")]
+    #[error(
+        "this operation is not implemented (see comment at the call site for the phase that fills it in)"
+    )]
     Unimplemented,
 
     #[error("internal error")]

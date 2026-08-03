@@ -4,26 +4,25 @@
 //! from, and `build.rs` in this crate for why they are compiled with
 //! `build_server(true)` when upstream compiles them with `build_server(false)`.
 //!
-//! We `include!` the generated code directly from `OUT_DIR` rather than using
-//! a `tonic::include_proto!`-style sugar macro. This is a deliberate, boring
-//! choice: it has no dependency on which crate (`tonic` vs `tonic-prost`)
-//! happens to export that macro in a given tonic 0.14.x point release, which
-//! we could not verify on the machine this scaffold was written on (no local
-//! Rust toolchain to compile-check against). If a future contributor
-//! confirms the macro location, switching to it is a pure convenience change.
+//! We use `tonic::include_proto!`, verified against tonic 0.14.6: it expands
+//! to exactly `include!(concat!(env!("OUT_DIR"), "/<package>.rs"))`, the same
+//! `OUT_DIR` layout `tonic-prost-build` writes in `build.rs`. tonic-prost
+//! 0.14's split moved codegen into `tonic-prost-build`, but the include
+//! macro itself still lives in `tonic` (see `tonic::macros`), unchanged from
+//! pre-split tonic-build usage.
 
 #![allow(clippy::doc_markdown)]
 
 /// `package epic_urc;` from `auth_api.proto` -- the `UrcAuthApi` service.
 /// This is the primary contract of the whole project.
 pub mod epic_urc {
-    include!(concat!(env!("OUT_DIR"), "/epic_urc.rs"));
+    tonic::include_proto!("epic_urc");
 }
 
 /// `package ucs.auth;` from `rebac_api.proto` -- the `RebacApi` service.
 pub mod ucs {
     pub mod auth {
-        include!(concat!(env!("OUT_DIR"), "/ucs.auth.rs"));
+        tonic::include_proto!("ucs.auth");
     }
 }
 

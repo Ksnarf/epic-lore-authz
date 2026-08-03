@@ -18,11 +18,12 @@ do not flip a task to `[x]` without that proof; see the individual gate notes.
       via PowerShell `Get-FileHash` (see UPSTREAM.md), not fabricated.
 - [x] Scaffold `lore-authz-proto` crate: `build.rs` compiling the vendored
       protos with `tonic_prost_build` and `.build_server(true)`.
-      [code-says] file exists at `crates/lore-authz-proto/build.rs`; NOT
-      compiled (no local Rust toolchain on the scaffolding machine -- see
-      repo root note below). Needs a real `cargo build` with `protoc` on
-      `PATH` to confirm the generated code actually compiles and that the
-      `include!` path (`OUT_DIR`) resolves as expected.
+      [code-says] Compiled for real in a pinned Docker build image
+      (`docker/Dockerfile.build`, `rust:1.97.1-slim-trixie` + protoc);
+      `cargo check --workspace` and `cargo build --workspace` both pass
+      clean (no warnings). Switched `lib.rs` from a raw `include!` to
+      `tonic::include_proto!`, now that the macro's expansion could
+      actually be verified against tonic 0.14.6.
 - [ ] gRPC server implementing (real logic, not stubs):
       `HealthCheck` [x, real, trivial], `StartAuthSession`, `GetAuthSession`,
       `ExchangeUserTokenForMultiresourceToken`.
@@ -137,22 +138,85 @@ within TTL.
 - [x] Workspace `Cargo.toml` with versions pinned to match
       `EpicGames/lore`'s own `[workspace.dependencies]` at the pinned
       commit (tonic 0.14.2, tonic-prost / tonic-prost-build 0.14.2, prost
-      0.14.1, jsonwebtoken 9.3.1). [code-says], not built (no local Rust
-      toolchain -- see verification note below).
+      0.14.1, jsonwebtoken 9.3.1). [code-says], builds clean (see below).
 - [x] CI workflows: `ci.yml` (fmt/build/test/clippy),
       `proto-drift.yml` (pinned-commit hash check + upstream-main warn).
       [code-says], not run (would require a push to GitHub Actions; this
-      repo is commit-only per the task constraints, not pushed).
+      repo is commit-only per the task constraints, not pushed). `ci.yml`
+      now pins `dtolnay/rust-toolchain@1.97.1` (matches
+      `rust-toolchain.toml` and `docker/Dockerfile.build`) and both
+      `build-and-test` / `clippy` jobs install `protobuf-compiler` --
+      the same recipe proven locally in the Docker image below.
 - [x] `docs/architecture.md`, `docs/protocol-notes.md`,
       `docs/open-questions.md`, `docs/configuration.md`.
 - [x] `.env.example` with placeholder-only values covering every config
       surface documented in `docs/configuration.md`.
 - [x] `.gitignore` / `.gitattributes` / `rust-toolchain.toml`.
 
-**Verification note**: `cargo`/`rustc` are not installed on the machine this
-scaffold was written on (confirmed via both Bash and PowerShell: "command
-not found" / "not recognized"). `cargo fmt --check` and `cargo build` could
-NOT be run. Everything under crates/ is UNVERIFIED to compile. This is
-called out honestly rather than claimed as working; the first real task for
-whoever picks this up should be installing a Rust toolchain + `protoc` and
-running `cargo build --workspace` for the first time.
+## Compile pass (2026-08-03, this session)
+
+- [x] `docker/Dockerfile.build`: pinned `rust:1.97.1-slim-trixie` +
+      `protobuf-compiler` (rust:1-slim lacks protoc, which
+      `tonic-prost-build` needs). `scripts/build.sh` / `scripts/build.ps1`
+      wrap it for POSIX and Windows PowerShell. [verified-e2e] image builds
+      and both scripts' underlying `docker run` invocation was exercised
+      directly; see command log below.
+- [x] `rust-toolchain.toml` changed from floating `channel = "stable"` to
+      pinned `channel = "1.97.1"` -- "stable" was making every rustup-shimmed
+      cargo/rustc invocation hit the network to re-resolve and re-sync,
+      which defeats reproducibility. [verified-e2e]: confirmed the
+      "syncing channel updates" network call disappeared after the pin.
+- [x] Fixed unused-import warning at
+      `crates/lore-authz-core/src/policy.rs:15` (`AuthzClaims` was imported
+      but never used in that file; removed the import).
+      [verified-e2e] `cargo check` no longer warns.
+- [x] Silenced the `Config` dead-code warning in
+      `crates/lore-authz-server/src/config.rs` with `#[allow(dead_code)]`
+      plus a comment explaining most fields are read starting Phase 0/1,
+      not actually dead. [verified-e2e].
+- [x] `crates/lore-authz-proto/src/lib.rs`: switched from the raw
+      `include!(concat!(env!("OUT_DIR"), ...))` to `tonic::include_proto!`,
+      now that its expansion (`include!(concat!(env!("OUT_DIR"),
+      "/<package>.rs"))`, defined in `tonic-0.14.6/src/macros.rs`) could be
+      verified against a real tonic 0.14.6 checkout. Removed the apologetic
+      comment. [verified-e2e]: recompiled clean after the switch.
+- [x] `crates/lore-authz-proto/build.rs`: verified as-is against the real
+      tonic-prost-build 0.14.6 API (`Config::new()`, `.enable_type_names()`,
+      `.bytes([...])`, `tonic_prost_build::configure()...compile_with_config`)
+      -- no changes needed, it compiled and generated code on the first
+      real build. `.build_server(true)` confirmed present and doing what
+      the comment says (generates `UrcAuthApi`/`RebacApi` server traits).
+- [x] `axum` 0.8 / `tonic` 0.14 signatures in
+      `crates/lore-authz-server/src/{http,grpc,main,config}.rs`: verified
+      as-is, no changes needed. `{session_code}` / `{*rest}` axum 0.8 path
+      syntax, `#[tonic::async_trait]` impls, and generated message/struct
+      names (incl. the `ExchangeAPIKeyForUserToken*` ->
+      `ExchangeApiKeyForUserToken*` heck-casing gotcha) all matched what
+      the scaffold author had already written.
+- [x] `.github/workflows/ci.yml`: pinned `dtolnay/rust-toolchain@1.97.1` in
+      all three jobs (was `@stable`) to match the local pin; protoc install
+      steps were already present and correct.
+- [x] `Cargo.lock` committed (workspace produces a binary,
+      `lore-authz-server`).
+
+**Verification (this session, 2026-08-03)**: built and ran inside
+`docker/Dockerfile.build` (`rust:1.97.1-slim-trixie` + protoc) via
+`docker run --rm -v <repo>:/work -w /work epic-lore-authz-build:local ...`
+(Docker reached via PowerShell, per this box's environment notes):
+
+- `cargo check --workspace` -- clean, 0 warnings.
+- `cargo build --workspace` -- clean, 0 warnings, `Finished dev profile`.
+- `cargo fmt --all -- --check` -- clean after one `cargo fmt --all` pass
+  (3 files had minor formatting-only diffs: `error.rs`, `config.rs` comment
+  alignment, `grpc.rs` line-wrap; no logic changed, confirmed via `git diff`).
+- `cargo clippy --workspace --all-targets -- -D warnings` -- clean, 0
+  warnings/errors.
+- `cargo test --workspace` -- 0 tests exist yet (Phase 0 compat tests are
+  still not-started, see below); the 0/0 result is expected, not a failure.
+
+Not done in this pass (unchanged from before, still open): the
+Phase 0 compat tests, the real IdP/gRPC business logic, and the
+integration test against real `lore-server` / `lore` CLI. This pass was
+scoped to "make it compile, stay stubbed, fail closed" -- it did not add
+or change any RPC/HTTP business logic; every non-trivial handler still
+returns `Status::unimplemented` / HTTP 501.

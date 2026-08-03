@@ -1,0 +1,29 @@
+# Build/CI image for epic-lore-authz.
+#
+# Pinned to an exact Rust release (not a floating "1" or "latest" tag) so a
+# build run today and a build run a year from now use the same compiler.
+# Bump this tag deliberately, in its own commit, when the pin needs to move.
+#
+# rust:1-slim (the floating tag) lacks protoc, which tonic-prost-build
+# (see crates/lore-authz-proto/build.rs) requires to compile the vendored
+# protos under proto/vendor/. That is the only reason this image exists.
+FROM rust:1.97.1-slim-trixie
+
+# protobuf-compiler: protoc for tonic-prost-build.
+# pkg-config: some transitive build scripts probe for it even when unused;
+#   cheap to have, avoids surprise failures as dependencies change.
+# ca-certificates: rustls-native-roots (tonic's tls-native-roots feature)
+#   reads the system trust store; harmless at build time, required at
+#   container run time if this image is ever used to run the binary.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        protobuf-compiler \
+        pkg-config \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# rust-toolchain.toml declares these components; keep the image in sync with
+# it so `cargo fmt` / `cargo clippy` work without an extra rustup step.
+RUN rustup component add rustfmt clippy
+
+WORKDIR /work

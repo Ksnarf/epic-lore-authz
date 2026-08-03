@@ -1,3 +1,8 @@
 [toolchain]
-channel = "stable"
+# Pinned to an exact release (matches docker/Dockerfile.build's rust:1.97.1-slim-trixie)
+# rather than the floating "stable" channel. "stable" makes every rustup-shimmed
+# cargo/rustc invocation hit the network to resolve which version "stable"
+# currently means and re-sync components, which both defeats reproducibility
+# and breaks offline builds. An explicit version pins to one toolchain, once.
+channel = "1.97.1"
 components = ["rustfmt", "clippy"]

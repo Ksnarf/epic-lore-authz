@@ -12,7 +12,6 @@ use async_trait::async_trait;
 
 use crate::AuthzError;
 use crate::claims::AuthnClaims;
-use crate::claims::AuthzClaims;
 use crate::claims::SignedToken;
 use crate::model::Principal;
 

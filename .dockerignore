@@ -1,0 +1,7 @@
+# Keep the build image's context small and free of local build artifacts.
+# docker/Dockerfile.build never COPYs source in (the build scripts bind-mount
+# the repo at run time instead), so this only affects `docker build` speed
+# and what could theoretically leak into image layers.
+/target
+**/target
+.git

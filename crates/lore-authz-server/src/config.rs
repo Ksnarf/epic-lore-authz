@@ -6,6 +6,11 @@
 use std::env;
 use std::net::SocketAddr;
 
+// Most fields are not read yet: this scaffold only wires grpc_listen_addr
+// and http_listen_addr into main.rs. The rest become load-bearing as Phase 0
+// / Phase 1 tasks in tasks.md land (token minting, signing keys, IdP). Not
+// dead code in the design; just not consumed yet.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Postgres connection string. Phase 0 runs entirely in memory and does
@@ -90,7 +95,7 @@ impl Config {
             jwt_issuer: env_var("JWT_ISSUER")?,
             jwt_audience,
             authn_token_ttl_secs: env_var_or("AUTHN_TOKEN_TTL_SECS", "36000").parse()?, // 10h
-            authz_token_ttl_secs: env_var_or("AUTHZ_TOKEN_TTL_SECS", "3600").parse()?, // 1h
+            authz_token_ttl_secs: env_var_or("AUTHZ_TOKEN_TTL_SECS", "3600").parse()?,  // 1h
             signing_key_source: env_var_or("SIGNING_KEY_SOURCE", "file:///CHANGE_ME.jwk"),
             jwks_path: env_var_or("JWKS_PATH", "/.well-known/jwks.json"),
             grpc_listen_addr: env_var_or("GRPC_LISTEN_ADDR", "0.0.0.0:8443").parse()?,
