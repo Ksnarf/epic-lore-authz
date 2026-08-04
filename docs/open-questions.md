@@ -7,20 +7,33 @@ not have time to read in full. Resolve these during Phase 0 unless noted
 otherwise. Do not treat any of these as settled until there is a passing
 integration test proving the answer.
 
-## Q1. `UserToken.expires_at` units: seconds or milliseconds? (HIGH PRIORITY)
+## Q1. `UserToken.expires_at` units: seconds or milliseconds? (SETTLED)
 
-The proto comment on `epic_urc.UserToken.expires_at` just says "Epoch."
-Evidence from reading the lore CLI's transport and credential handling
-leans **milliseconds**, but this was not confirmed by running real code.
-Getting this wrong by a factor of 1000 means either every minted token
-expires instantly (CLI immediately re-logs-in / fails), or tokens that
-effectively never expire (a real security issue given the stateless-token
-revocation window noted in `docs/protocol-notes.md`).
+**SETTLED (this pass, by reading source, not by running the CLI): milliseconds.**
 
-**How to settle it**: mint a token with a known real-world expiry, feed it
-to the real unmodified `lore` CLI, and observe whether the CLI treats it as
-expired at the boundary you expect. `crates/lore-authz-core/src/claims.rs`
-has a `SignedToken.expires_at` field flagged with this same open question.
+`lore-transport/src/auth/ucs_auth.rs` assigns the proto's `expires_at`
+straight into a field literally named `expires_ms` with no `* 1000` scaling
+(`expires_ms: token.expires_at.max(0) as u64`, three call sites).
+`lore-transport/src/types.rs` documents that field as "Expiry as
+milliseconds since UNIX epoch". `lore-transport/src/connection.rs`'s own
+tests use millisecond-shaped literals for it (`1_700_000_000_000` -- a
+plausible 2023 date in milliseconds, a nonsense year-55919 date in
+seconds). By contrast, `lore-credential/src/jwt.rs`'s `user_info_from_token`
+explicitly multiplies the JWT's own `exp` claim by 1000 to get this same
+"milliseconds like all other timestamps in Lore" convention, confirming the
+JWT `exp` claim itself is ordinary seconds and `UserToken.expires_at` is a
+separate, already-millisecond field.
+
+This is source-level evidence, not an end-to-end run of the real `lore`
+CLI against a real `expires_at` value -- the tasks.md Phase 0 exit gate
+(a real `lore auth login` / `lore push` / `lore pull` against unmodified
+upstream binaries) is still the authoritative confirmation and has not run
+yet. Note that the 2026-08-03 integration run does **not** close this: it
+mints tokens directly rather than fetching them through
+`StartAuthSession`/`GetAuthSession`, so no `UserToken.expires_at`
+value ever crosses the wire in that test. See `docs/protocol-notes.md` #9. `crates/lore-authz-core/src/claims.rs`'s `SignedToken.expires_at` doc
+comment and `crates/lore-authz-server/src/minting.rs` (`signed_token`) now
+implement and cite this finding. See docs/protocol-notes.md #7a.
 
 ## Q2. The exact `lore-server` config key for `Endpoint.auth_url`
 
@@ -30,12 +43,23 @@ on the `lore-server` side is `environment.endpoint.auth_url`, but this was
 not confirmed by reading the settings loader that actually binds it.
 Needed before `docs/lore-server-setup.md` (not yet written) can be trusted.
 
-## Q3. The correlation-id gRPC metadata key
+## Q3. The correlation-id gRPC metadata key (SETTLED)
 
-`lore`'s `CorrelationInterceptor` injects a correlation id into gRPC
-metadata under a key name that is likely `x-correlation-id` but was not
-confirmed by reading the interceptor's source. Needed for log correlation
-between epic-lore-authz and `lore-server`/CLI logs, not for correctness.
+**SETTLED 2026-08-03, verified at runtime: `x-epic-correlation-id`.**
+
+The guess recorded here (`x-correlation-id`) was **wrong**. The constant is
+`lore_transport::grpc::CORRELATION_ID_HEADER = "x-epic-correlation-id"`
+(`lore-transport/src/grpc/mod.rs`), read server-side by
+`lore-server/src/correlation/layer.rs`. Proven end to end (integration tooling held locally) by sending the
+header on a real gRPC call and observing `lore-server` log
+`"Found existing correlation ID"` and then stamp the supplied value on
+every log line for that request. Without the header lore-server logs
+`"Generated correlation ID"` and invents a UUID.
+
+Caveat worth knowing: `lore-transport`'s `inject_correlation_id` is
+currently a no-op ("The correlation ID injection is now a no-op at this
+layer"), so the real CLI does not appear to send it today. See
+`docs/protocol-notes.md` #7d.
 
 ## Q4. Does `lore-server` ever actually call `CheckUserPermission` or `LookupUserPermissions`?
 
@@ -106,3 +130,38 @@ reading the caching code, not from a running test.
 Related to Q6. If `lore-server` never sends a bearer token on `RebacApi`
 calls, it may need some other credential (mTLS client cert, shared secret)
 to be trusted at all. Not yet decided; tracked for Phase 0/1 design.
+
+## Q13. Where does `ExchangeUserTokenForMultiresourceToken` get `idp` from?
+
+Not a wire-format question -- a design question for whoever wires that RPC
+(still `Status::unimplemented`, tasks.md). `AuthzClaims`/lore-server's
+`AuthorizationToken` require `idp` (docs/protocol-notes.md #2), but
+`AuthnClaims`/lore-server's `JWTUserInfo` (the AuthN token the RPC receives
+as its bearer token) has no `idp` field to decode it back out of. Proposed:
+look `idp` up from the `Principal` row `sub` identifies, via
+`Principal.idp_connection_id` (`crates/lore-authz-core/src/model.rs`) --
+requires Phase 1 persistence to exist first, so tracked here rather than
+solved in this Phase 0 pass. See docs/protocol-notes.md #7b and
+`crates/lore-authz-server/src/minting.rs`.
+
+Whatever design answers this question must make it structurally impossible
+to mint an AuthZ token without `idp` -- which is why `AuthzTokenInput::idp`
+is a mandatory `String` today, not an `Option`.
+
+## Q14. `kid` is randomly regenerated on every key load (NEW, needs fixing)
+
+Found while building the Phase 0 integration test.
+`crates/lore-authz-server/src/signing.rs`'s `key_from_pkcs8_der` assigns a
+fresh `Uuid::new_v4()` as the `kid` each time it runs, so two processes
+loading the SAME `SIGNING_KEY_SOURCE` file publish different `kid` values
+for the same key. Single-process Phase 0 is unaffected (it is why
+`dev-mint-token` takes an explicit `--kid`), but any multi-replica
+deployment breaks: a token minted by replica A carries A's `kid`, and a
+lore-server that fetched its JWKS from replica B rejects it with
+`KeyNotFound` after one wasted refetch.
+
+Proposed fix: derive `kid` deterministically from the public key material
+(RFC 7638 JWK thumbprint). That also makes `kid` stable across restarts,
+which key rotation (Phase 1) needs anyway -- a `Pending` key has to be
+published under the `kid` it will later sign with. Settle before Phase 1
+rotation work starts. See `docs/protocol-notes.md` #7e.

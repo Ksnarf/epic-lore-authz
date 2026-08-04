@@ -7,11 +7,13 @@
 //! `AuthNClaims` fallback shape and loses the `resources` claim. See
 //! docs/protocol-notes.md for the full explanation of that failure mode.
 //!
-//! TODO(phase 0): add a compat test that deserializes a token minted from
-//! these structs using a VERBATIM copy of lore-server's `AuthorizationToken`
-//! struct (MIT licensed, safe to vendor for test purposes). That is called
-//! out in the design plan as the single highest-value test in the project.
-//! Not included in this scaffold; tracked in tasks.md Phase 0.
+//! The compat test called out in the design plan as the single
+//! highest-value test in the project (a token minted from these structs
+//! deserializing into a VERBATIM copy of lore-server's `AuthorizationToken`
+//! with `resources` populated, plus the negative case for a missing `idp`)
+//! lives at `crates/lore-authz-server/tests/lore_compat.rs`. See
+//! `crates/lore-authz-server/src/minting.rs` for the functions that build
+//! and sign these claims.
 
 use serde::Deserialize;
 use serde::Serialize;
@@ -114,10 +116,32 @@ pub struct AuthnClaims {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignedToken {
     pub token: String,
-    /// UNVERIFIED UNIT: seconds or milliseconds since epoch? See
-    /// docs/open-questions.md Q1. Whatever unit is chosen MUST match what
-    /// this same field means in `epic_urc::UserToken.expires_at` on the
-    /// wire, and MUST be settled empirically (Phase 0) before this type is
-    /// treated as authoritative.
+    /// SETTLED (docs/open-questions.md Q1): **milliseconds** since the UNIX
+    /// epoch, matching `epic_urc::UserToken.expires_at` on the wire.
+    ///
+    /// This is NOT the same unit as the JWT's own `exp` claim inside
+    /// `token` (`AuthzClaims::expires_at` / `AuthnClaims::expires_at`
+    /// below), which is always whole seconds per the JWT spec and per
+    /// `jsonwebtoken`'s own `validate_exp`. Two different fields, two
+    /// different units, same English word "expires" -- do not conflate them
+    /// when minting (see `crates/lore-authz-server/src/minting.rs`).
+    ///
+    /// Evidence (verified against `EpicGames/lore` at the pinned commit
+    /// `f205899adf24b13b2d28e5c08d9256ac99c69f0c`):
+    /// `lore-transport/src/auth/ucs_auth.rs` assigns the proto's
+    /// `expires_at` straight into a field literally named `expires_ms` with
+    /// no `* 1000` scaling (`expires_ms: token.expires_at.max(0) as u64`,
+    /// three call sites); `lore-transport/src/types.rs` documents that
+    /// `expires_ms` field as "Expiry as milliseconds since UNIX epoch"; and
+    /// `lore-transport/src/connection.rs`'s own tests use
+    /// millisecond-shaped literals for it (e.g. `1_700_000_000_000`, which
+    /// is a plausible 2023 date in milliseconds but a nonsensical year-55919
+    /// date in seconds). By contrast, `lore-credential/src/jwt.rs`
+    /// (`user_info_from_token`) DOES multiply the JWT `exp` claim by 1000
+    /// ("JWT has number of seconds since UNIX epoch ... we want
+    /// milliseconds like all other timestamps in Lore") -- confirming the
+    /// JWT `exp` claim itself is seconds, and that the proto-level
+    /// `expires_at` is a separately-tracked millisecond value, not a
+    /// re-statement of the JWT's `exp`.
     pub expires_at: i64,
 }

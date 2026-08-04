@@ -652,11 +652,14 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "base64",
  "jsonwebtoken",
  "lore-authz-core",
  "lore-authz-proto",
+ "ring",
  "serde",
  "serde_json",
+ "serde_with",
  "thiserror",
  "tokio",
  "tonic",
@@ -665,6 +668,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

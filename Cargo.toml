@@ -33,6 +33,19 @@ jsonwebtoken = "9.3.1"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.143"
 serde_with = { version = "3.14.0", features = ["macros"] }
+# ring: jsonwebtoken 9.3.1's own Cargo.toml pins `ring = { version = "0.17.4",
+# features = ["std"] }` as its sole crypto backend (verified from
+# https://github.com/Keats/jsonwebtoken/blob/v9.3.1/Cargo.toml). We pin the
+# same version here so cargo resolves ONE ring in the dependency graph and so
+# the PKCS#8 document our key generation produces is guaranteed to round-trip
+# through the exact `EcdsaKeyPair::from_pkcs8` jsonwebtoken calls internally
+# when signing (crates/lore-authz-server/src/signing.rs).
+ring = { version = "0.17.4", features = ["std"] }
+# base64: jsonwebtoken 9.3.1 depends on `base64 = "0.22"` internally but does
+# not re-export it. We need the same URL_SAFE_NO_PAD encoding it uses
+# internally (see its src/serialization.rs) to build JWK `x`/`y` coordinates
+# by hand in crates/lore-authz-server/src/signing.rs.
+base64 = "0.22"
 
 axum = "0.8.4"
 tower = "0.5.2"

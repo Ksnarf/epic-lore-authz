@@ -90,7 +90,6 @@ epic-lore-authz/
   docs/                         architecture, protocol gotchas, open questions, config reference
   .github/workflows/            ci.yml (fmt/build/test/clippy), proto-drift.yml (upstream drift guard)
   tasks.md                      phased delivery plan with pass/fail proof criteria per phase
-  log.log                       append-only session log for this repo
 ```
 
 ## Status

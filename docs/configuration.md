@@ -15,9 +15,10 @@ Every value in `.env.example` is a placeholder. Never commit a real `.env`
 | `DB_SCHEMA` | no | `loreauth` | This product owns exactly one schema; never `public`, never a dedicated database, never superuser. |
 | `JWT_ISSUER` | yes | (none) | `iss` claim on every minted token. |
 | `JWT_AUDIENCE` | yes | (none) | Comma-separated root domains. Must include the lore server's own root domain -- see `docs/protocol-notes.md` section 3. |
+| `TOKEN_ENV` | no | `dev` | Value placed in the `env` claim of every minted token. Required by lore-server on both claim shapes -- see `docs/protocol-notes.md` section 2. |
 | `AUTHN_TOKEN_TTL_SECS` | no | `36000` (10h) | AuthN token lifetime. |
 | `AUTHZ_TOKEN_TTL_SECS` | no | `3600` (1h) | AuthZ token lifetime. Keep short: see the stateless-revocation-window note in `docs/protocol-notes.md`. |
-| `SIGNING_KEY_SOURCE` | yes | `file:///CHANGE_ME.jwk` | Phase 0: a `file://` JWK. Phase 1+: real key management. |
+| `SIGNING_KEY_SOURCE` | no | `file:///CHANGE_ME/signing-key.der` | Phase 0: a `file://` unencrypted PKCS#8 EC P-256 private key, PEM or raw DER (NOT a JWK -- see `crates/lore-authz-server/src/signing.rs`). If the file does not exist, an ephemeral dev key is generated in memory and a warning is logged. Phase 1+: real key management. |
 | `JWKS_PATH` | no | `/.well-known/jwks.json` | Path on the HTTP listener to serve this service's own JWKS on. |
 | `GRPC_LISTEN_ADDR` | no | `0.0.0.0:8443` | `UrcAuthApi` + `RebacApi`. Must be reachable over TLS trusted by the lore CLI's native roots in any real deployment. |
 | `HTTP_LISTEN_ADDR` | no | `0.0.0.0:8080` | JWKS, login, OIDC/SAML callbacks, health, metrics. |

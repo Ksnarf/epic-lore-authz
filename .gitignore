@@ -9,10 +9,16 @@ Cargo.lock.bak
 .env.*
 !.env.example
 
+# Phase 0 integration-test scratch: generated signing key, generated
+# lore-server config, local store data, minted tokens. Regenerated on every
+# run, never committed.
+/e2e-run/
+
 # Signing key material - never commit real keys
 *.jwk
 *.pem
 *.key
+*.der
 !**/testdata/**
 
 # Editors / OS
@@ -27,3 +33,6 @@ Thumbs.db
 /logs/
 *.log
 /log.log
+
+# Local working notes. Never committed - this repository is public.
+.local-notes/

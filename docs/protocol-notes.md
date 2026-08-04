@@ -10,6 +10,14 @@ pinned commit (`f205899adf24b13b2d28e5c08d9256ac99c69f0c`, see
 `proto/vendor/UPSTREAM.md`), specifically `lore-server/src/auth/jwt.rs` and
 `lore-server/src/auth/jwk.rs`.
 
+As of 2026-08-03, sections 2 and 4 have additionally been confirmed
+**at runtime** against an unmodified `lore-server` binary built from that
+pinned commit, running in Docker with `server.auth.jwk.endpoint` pointed at
+this project's live JWKS endpoint (integration tooling held locally).
+Findings that came out of that run are marked **(RUNTIME-VERIFIED)**;
+sections still resting on source reading alone are marked **(SOURCE
+ONLY)**.
+
 ## 1. The two-token model
 
 `lore` uses two distinct JWTs. Confusing them means nothing works.
@@ -54,6 +62,19 @@ deserialize successfully.
   document -- if a customer reports "my token has the right resources but
   I still get denied," check for a missing `idp` claim first.
 
+**(RUNTIME-VERIFIED)** The missing-`idp` fallback is worse than "silent" in
+the logging sense: at `RUST_LOG=debug` a real `lore-server` logs
+`"Decoding JWT token"` and then **nothing at all** for that request's auth
+decision. There is no warning, no error, and none of the
+`"Decoded user info: AuthorizationToken { .. }"` line a correctly-shaped
+token produces. The only externally visible signal is the eventual
+`PermissionDenied` on a data-plane RPC. Diagnostic rule: if lore-server logs
+`"Decoding JWT token"` for a request but never the matching
+`"Decoded user info"` line, the token fell back to the AuthN shape -- check
+`idp` first. (`lore-server/src/auth/jwt.rs`'s `verify_token_internal` only
+logs inside the `if let Ok(..)` AuthorizationToken branch and on the
+fallback's *error* path; the fallback's success path is unlogged.)
+
 `aud` accepts either a single string or an array on the wire (the upstream
 struct uses `serde_with`'s `OneOrMany<_, PreferMany>`; our `AuthzClaims` and
 `AuthnClaims` mirror this exactly). Always emit an array when minting.
@@ -96,6 +117,30 @@ if `aud` does not contain the remote domain it is about to be used against.
 - Algorithms exercised in upstream tests: ES256 and HS256. Recommend ES256
   or RS256 for anything beyond local dev/tests.
 
+**(RUNTIME-VERIFIED)** Confirmed against a running `lore-server`:
+
+- The JWKS document this project serves at `/.well-known/jwks.json` is
+  fetched and accepted as-is. `lore-server/src/server.rs` calls
+  `jwk_service.fetch_new_keys(None).await?` during boot, so **a JWKS
+  endpoint that is unreachable, non-200, or malformed aborts lore-server
+  startup entirely** -- it is not a lazy or degraded path. Order of
+  operations in any deployment: the auth sidecar must be serving JWKS
+  before lore-server starts, or lore-server will not come up. Any
+  automation that brings both up together must poll the sidecar for a
+  ready JWKS response before starting lore-server, for exactly this
+  reason.
+- The `kid` cache-miss refetch is real and observable: presenting a token
+  whose `kid` is not in the cached set produces a second, in-request
+  `reqwest::connect` to the JWKS URL, then `PermissionDenied` with
+  `Not allowed (KeyNotFound(NotFound))` when the refetch still does not
+  supply it.
+- A token signed by a key that is not the published one, but stamped with a
+  `kid` that IS published, is rejected as
+  `PermissionDenied: Not allowed (ValidationFailed(Error(InvalidSignature)))`
+  and logs a `WARN "Unexpected error decoding JWT AuthN token"`. Signature
+  verification is genuinely enforced; the `kid` is a lookup key, not a
+  trust decision.
+
 ## 5. TLS is mandatory on the client-facing auth endpoint
 
 The lore CLI rewrites *any* scheme to `https` before dialing the auth
@@ -123,6 +168,7 @@ whose `resource_id` equals `urc-{repository_id}` or `urc-*`. **It never
 reads the `permission` string array inside `ResourcePermission`.**
 
 Consequences:
+
 - Native enforcement in OSS `lore` is **binary per repository** -- you have
   access, or you do not.
 - The `read`/`write`/`admin` permission vocabulary is advisory as far as the
@@ -130,7 +176,93 @@ Consequences:
   server, or for operator visibility), but must not market fine-grained
   enforcement that does not exist server-side.
 
-## 7. Stateless token revocation window
+## 7a. `SignedToken.expires_at` is milliseconds (Q1 SETTLED)
+
+`docs/open-questions.md` Q1 asked whether `epic_urc.UserToken.expires_at`
+(proto comment just says "Epoch") is seconds or milliseconds. Settled by
+reading `lore-transport/src/auth/ucs_auth.rs`: it assigns the proto's
+`expires_at` straight into a field literally named `expires_ms` with **no**
+`* 1000` scaling (`expires_ms: token.expires_at.max(0) as u64`, at all three
+call sites in that file). `lore-transport/src/types.rs` documents that
+`expires_ms` field as "Expiry as milliseconds since UNIX epoch", and
+`lore-transport/src/connection.rs`'s own tests use millisecond-shaped
+literals for it (`1_700_000_000_000`, a plausible date in ms, nonsense in
+seconds). By contrast `lore-credential/src/jwt.rs` DOES multiply the JWT's
+own `exp` claim by 1000 to get milliseconds ("JWT has number of seconds
+since UNIX epoch ... we want milliseconds like all other timestamps in
+Lore") -- confirming the JWT `exp` claim itself is ordinary JWT-spec
+seconds, and `UserToken.expires_at` is a separately-tracked millisecond
+value, not a restatement of `exp`. **Do not conflate the two when minting**:
+see `crates/lore-authz-server/src/minting.rs`.
+
+## 7b. Minting `idp` for an AuthZ token cannot come from the AuthN token
+
+`AuthzClaims`/lore-server's `AuthorizationToken` require `idp` (see section
+2 above). But `AuthnClaims`/lore-server's `JWTUserInfo` (the AuthN "user"
+token shape) has **no** `idp` field at all -- confirmed from
+`lore-server/src/auth/jwt.rs`'s `JWTUserInfo` struct. Since
+`ExchangeUserTokenForMultiresourceToken` receives only the caller's AuthN
+token (decoded as `JWTUserInfo`) plus requested resource ids, a real
+implementation cannot recover `idp` by decoding that token -- it must look
+it up some other way (e.g. from the `Principal` row `sub` identifies, via
+`Principal.idp_connection_id`; see `crates/lore-authz-core/src/model.rs`).
+This is a real constraint on whoever wires that RPC (still open in
+tasks.md), not a documentation gap: flagged here, in
+`crates/lore-authz-server/src/minting.rs`, and in
+`docs/open-questions.md` so it is not missed when that RPC is implemented.
+
+## 7c. `SIGNING_KEY_SOURCE` cannot point at a private-key JWK
+
+This repo's own scaffold originally documented `SIGNING_KEY_SOURCE` as
+pointing at "a single ES256 JWK". That is not achievable with this
+project's pinned `jsonwebtoken` 9.3.1: `jsonwebtoken::jwk::Jwk` (see that
+crate's own module doc, "only meant to be used to deal with public JWK, not
+generate ones") has no private-key ("d") variant in
+`AlgorithmParameters::EllipticCurve` -- it can only represent a PUBLIC key.
+`.env.example` and `docs/configuration.md` now describe `SIGNING_KEY_SOURCE`
+as pointing at an unencrypted PKCS#8 EC P-256 private key file (PEM or raw
+DER) instead. See `crates/lore-authz-server/src/signing.rs`.
+
+## 7d. Correlation-id metadata key is `x-epic-correlation-id` (Q3 SETTLED)
+
+**(RUNTIME-VERIFIED)** `docs/open-questions.md` Q3 guessed
+`x-correlation-id`. That guess was **wrong**. The real constant is
+`lore_transport::grpc::CORRELATION_ID_HEADER = "x-epic-correlation-id"`
+(`lore-transport/src/grpc/mod.rs`), consumed server-side by
+`lore-server/src/correlation/{layer,service}.rs`.
+
+Confirmed end to end rather than only by reading the constant: sending
+`-H "x-epic-correlation-id: e2e-correlation-probe-0001"` on a gRPC call
+makes lore-server log `"Found existing correlation ID"` and then carry
+`"correlation_id":"e2e-correlation-probe-0001"` on every subsequent log line
+for that request, including the auth lines. Without the header it logs
+`"Generated correlation ID"` and invents a UUID. This is the join key for
+correlating epic-lore-authz logs with lore-server logs.
+
+Note for anyone reading upstream client code: `lore-transport`'s
+`inject_correlation_id` is currently a **no-op** with the comment "The
+correlation ID injection is now a no-op at this layer", so the real `lore`
+CLI does not appear to set this header today -- the server generates one.
+The header is honoured when present regardless of who sets it.
+
+## 7e. `SIGNING_KEY_SOURCE` produces a NEW random `kid` on every load
+
+Not a lore-protocol fact, a fact about this project that the integration
+test forced into the open. `signing.rs`'s `key_from_pkcs8_der` assigns
+`Uuid::new_v4()` as the `kid` every time a key is loaded. Two processes
+loading the SAME private key file therefore publish DIFFERENT `kid` values
+for the same key. That is harmless for a single Phase 0 process, and it is
+why `dev-mint-token` has to be handed the running server's `kid` explicitly.
+
+It is a real bug for any multi-replica deployment: a token minted by replica
+A carries A's `kid`, lore-server fetches the JWKS from whichever replica the
+load balancer picks, and a miss costs one refetch and then a hard
+`KeyNotFound` rejection. Tracked as `docs/open-questions.md` Q14; the fix is
+to derive `kid` deterministically from the key material (an RFC 7638 JWK
+thumbprint), which also makes the `kid` stable across restarts. Must be
+settled before Phase 1 ships key rotation.
+
+## 8. Stateless token revocation window
 
 Revoking a `role_binding` does not invalidate already-issued AuthZ tokens.
 This is mitigated only by keeping AuthZ token TTL short (recommended: 1
@@ -138,3 +270,29 @@ hour default, see `.env.example`). Document this window explicitly to
 operators -- it is the main security caveat of a stateless-token design. A
 `jti` denylist is possible later but requires `lore-server` support it does
 not currently have.
+
+## 9. What the integration test still does NOT cover
+
+The integration test drives `lore-server` with `grpcurl`, not with the real
+`lore` CLI. So everything above about **client-side** behaviour is still
+**(SOURCE ONLY)** and unproven at runtime:
+
+- Section 3's `acceptable_root_domains()` check. `grpcurl` does not perform
+  it, so an `aud` that would be rejected by the CLI still passes this test
+  suite. Section 3 remains the authority on what `aud` must contain.
+- Section 5's "the CLI rewrites any scheme to https". The test suite talks
+  plaintext h2c to `lore-server`'s gRPC port, which works because
+  `[server.grpc.certificate]` is unset. It says nothing about the CLI path.
+- `docs/open-questions.md` Q1 (`UserToken.expires_at` units). Nothing in
+  this test exercises `UserToken` on the wire at all -- the tokens are
+  minted directly rather than fetched through
+  `StartAuthSession`/`GetAuthSession`, which are still
+  `Status::unimplemented` in this project.
+- QUIC. Only the gRPC/TCP listener was exercised. `lore-server` also serves
+  QUIC on the same port number over UDP with its own auth path
+  (`lore-server/src/quic/storage_service.rs` takes the same `JwtVerifier`),
+  which this suite does not touch.
+
+The tasks.md Phase 0 exit gate (real `lore auth login` / `clone` / `push` /
+`pull`) is what closes those gaps, and it needs the still-stubbed gRPC RPCs
+to exist first.

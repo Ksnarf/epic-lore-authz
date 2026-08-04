@@ -6,10 +6,14 @@
 use std::env;
 use std::net::SocketAddr;
 
-// Most fields are not read yet: this scaffold only wires grpc_listen_addr
-// and http_listen_addr into main.rs. The rest become load-bearing as Phase 0
-// / Phase 1 tasks in tasks.md land (token minting, signing keys, IdP). Not
-// dead code in the design; just not consumed yet.
+// Most fields are not read yet: main.rs wires grpc_listen_addr,
+// http_listen_addr, and (as of this pass) signing_key_source. jwt_issuer /
+// jwt_audience / token_env are consumed by crates/lore-authz-server/src/
+// minting.rs's functions but not yet threaded into main.rs, since the gRPC
+// handlers that would call them (ExchangeUserTokenForMultiresourceToken and
+// friends) are still Status::unimplemented stubs -- see tasks.md. The rest
+// become load-bearing as Phase 1 tasks land (IdP, persistence). Not dead
+// code in the design; just not consumed yet.
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -29,15 +33,26 @@ pub struct Config {
     /// checked independently by the lore CLI and by lore-server. Comma
     /// separated in the env var.
     pub jwt_audience: Vec<String>,
+    /// Value placed in the `env` claim of every minted token (e.g.
+    /// "dev"/"staging"/"prod"). Per docs/protocol-notes.md section 2, this
+    /// is required on BOTH the AuthZ and AuthN claim shapes -- omitting it
+    /// fails both decode attempts loudly, unlike a missing `idp` (AuthZ
+    /// shape only), which fails silently. See
+    /// crates/lore-authz-server/src/minting.rs.
+    pub token_env: String,
     /// Suggested default from the design plan (section A.3): short-lived,
     /// re-login on expiry rather than refresh (RefreshAuthSession is dead
     /// upstream).
     pub authn_token_ttl_secs: u64,
     pub authz_token_ttl_secs: u64,
 
-    /// Where signing keys come from. Phase 0: a single key read from a file
-    /// or env var. Phase 1: a real KMS/HSM-backed rotation flow. See
-    /// docs/architecture.md.
+    /// Where signing keys come from. Phase 0: `file://` pointing at an
+    /// unencrypted PKCS#8 EC private key (PEM or raw DER; NOT a JWK -- see
+    /// `crates/lore-authz-server/src/signing.rs`'s module doc for why a
+    /// private-key JWK cannot be loaded through this project's pinned
+    /// `jsonwebtoken` crate). If the file does not exist, an ephemeral dev
+    /// key is generated in memory instead and a warning is logged. Phase 1:
+    /// a real KMS/HSM-backed rotation flow. See docs/architecture.md.
     pub signing_key_source: String,
     /// Path this binary serves its own JWKS document on, for lore-server's
     /// `auth.jwk.endpoint` to point at.
@@ -94,9 +109,13 @@ impl Config {
             db_schema: env_var_or("DB_SCHEMA", "loreauth"),
             jwt_issuer: env_var("JWT_ISSUER")?,
             jwt_audience,
+            token_env: env_var_or("TOKEN_ENV", "dev"),
             authn_token_ttl_secs: env_var_or("AUTHN_TOKEN_TTL_SECS", "36000").parse()?, // 10h
             authz_token_ttl_secs: env_var_or("AUTHZ_TOKEN_TTL_SECS", "3600").parse()?,  // 1h
-            signing_key_source: env_var_or("SIGNING_KEY_SOURCE", "file:///CHANGE_ME.jwk"),
+            signing_key_source: env_var_or(
+                "SIGNING_KEY_SOURCE",
+                "file:///CHANGE_ME/signing-key.der",
+            ),
             jwks_path: env_var_or("JWKS_PATH", "/.well-known/jwks.json"),
             grpc_listen_addr: env_var_or("GRPC_LISTEN_ADDR", "0.0.0.0:8443").parse()?,
             http_listen_addr: env_var_or("HTTP_LISTEN_ADDR", "0.0.0.0:8080").parse()?,
