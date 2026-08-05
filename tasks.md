@@ -686,3 +686,131 @@ anything resembling real key material -- zero hits beyond the pre-existing
 PEM-marker string literals `signing.rs` already used to detect key format,
 which are not real key material. See the coordinator's session log for the
 exact commands and their output.
+
+## Security review remediation, item 1: RebacApi caller-identity gate (2026-08-05)
+
+A security review found `RebacApi::create_resource` / `delete_resource`
+(`crates/lore-authz-server/src/grpc.rs`) performed NO caller-identity check
+at all -- an unauthenticated party reaching the gRPC port could iterate the
+predictable `urc-{repository_id}` convention calling `delete_resource`,
+mass-revoking authorization for every repository (a full authorization-
+server DoS with zero credentials; delete soft-deletes and correctly denies
+afterward, so this was availability, not a bypass). A LOW finding in the
+same review: `create_resource` accepted any non-empty `resource_id`,
+including the literal wildcard sentinel `urc-*`.
+
+- [x] Require caller authentication on BOTH `RebacApi` RPCs.
+      [verified-e2e] New module `crates/lore-authz-server/src/
+      service_auth.rs`: `verify_rebac_caller` gates both RPCs on a shared
+      secret (`REBAC_SERVICE_TOKEN`), presented as `authorization: Bearer
+      <secret>`. Deliberately NOT `crate::caller`'s bearer-JWT pattern: read
+      `lore-server/src/authnz/rebac.rs`'s `RebacClientHelper` (read-only, in
+      the sibling `epic-lore` checkout, per this pass's constraints) and
+      confirmed it attaches no bearer token and no client TLS identity to
+      these calls --
+      only a `CorrelationInterceptor`. A JWT check would verify a token
+      `lore-server` never sends. A shared secret matches the design plan's
+      own recommendation (`docs/open-questions.md` Q6/Q12, now resolved on
+      this project's side) and is enforceable entirely within this repo.
+      `RebacApiService::authorize_caller` (`grpc.rs`) runs BEFORE
+      `require_db`, so an unauthenticated caller learns nothing about this
+      service's Postgres configuration state.
+- [x] FAIL CLOSED when the gate is not configured.
+      [verified-e2e] `verify_rebac_caller` denies with
+      `Status::unauthenticated` when `REBAC_SERVICE_TOKEN` is `None` or
+      empty, regardless of what the caller presents -- proven by
+      `service_auth::tests::unconfigured_secret_denies_even_with_a_
+      presented_token`, `grpc::tests::create_resource_denies_when_gate_is_
+      unconfigured_even_with_a_presented_token`, and the `delete_resource`
+      equivalent. `main.rs` logs a startup warning when unset, mirroring the
+      existing `DATABASE_URL`-unset warning.
+- [x] `create_resource` rejects the literal wildcard sentinel and validates
+      `resource_id` format (the LOW finding).
+      [verified-e2e] `grpc.rs`'s `validate_new_resource_id`: rejects empty,
+      rejects the exact string `db::permissions::WILDCARD_RESOURCE_PATTERN`
+      (`"urc-*"`), requires the `"urc-"` prefix, and requires a non-empty
+      ASCII alphanumeric (plus `-`/`_`) suffix -- matches the real
+      `urc-{repository_id}` shape (confirmed against `lore-base::types::
+      Partition`'s hex `Display` impl, read-only, in the `epic-lore`
+      checkout) without being so strict it would reject the short
+      alphanumeric ids this project's own test fixtures already use (e.g.
+      `"urc-idem"`). Proven by `grpc::tests::create_resource_rejects_
+      wildcard_sentinel_resource_id`, `..._rejects_resource_id_missing_urc_
+      prefix`, `..._rejects_empty_suffix_after_prefix`, and end to end
+      against real Postgres by `tests/postgres_backed.rs`'s
+      `rebac_create_resource_rejects_wildcard_sentinel_against_real_db`.
+- [x] Tests proving all five required cases.
+      [verified-e2e] Unauthenticated DENIED:
+      `grpc::tests::create_resource_denies_unauthenticated_caller` /
+      `delete_resource_denies_unauthenticated_caller` (unit) and
+      `tests/postgres_backed.rs`'s `rebac_create_resource_denies_
+      unauthenticated_caller_against_real_db` / `rebac_delete_resource_
+      denies_unauthenticated_caller_against_real_db` (real Postgres; the
+      latter also asserts the resource genuinely still exists after the
+      denied delete). Wrong credential DENIED:
+      `create_resource_denies_wrong_service_token` /
+      `delete_resource_denies_wrong_service_token` (unit) and
+      `rebac_create_resource_denies_wrong_service_token_against_real_db`
+      (real Postgres). Unconfigured gate DENIED: see above. Valid credential
+      ALLOWED: proven for real, not just by absence of a denial, by the
+      pre-existing `create_resource_is_idempotent` and `delete_resource_
+      revokes_access_and_is_idempotent` tests in `tests/postgres_backed.rs`,
+      updated this pass to present `REBAC_SERVICE_TOKEN` via a new `Harness::
+      rebac_request` helper and still passing against a real Postgres
+      container. Wildcard-sentinel REJECTED: see above.
+      `service_auth.rs`'s own unit tests additionally cover a
+      prefix-of-the-real-secret probe
+      (`a_token_that_is_a_prefix_of_the_real_one_still_denies`) and an empty
+      `REBAC_SERVICE_TOKEN=""` being treated as unconfigured, not as an
+      "empty secret matches empty bearer" allow-all.
+
+**Config surface**: `REBAC_SERVICE_TOKEN` (`.env.example`,
+`docs/configuration.md`'s new dedicated section). **Honest gap, stated in
+both docs**: the pinned/unmodified upstream `lore-server` this project
+integrates against has no config surface to send this (or any) header on
+this hop, so enabling this gate is a real deployment requirement (something
+on the network path must inject the header), not something achievable by
+this repo alone -- see `docs/open-questions.md` Q6/Q12 and
+`docs/configuration.md`.
+
+**Proof, all four workspace checks run for real in the pinned Docker build
+image (`docker/Dockerfile.build`, Docker reached via PowerShell)**:
+
+- `cargo build --workspace`: clean, `Finished` dev profile, 0 warnings.
+- `cargo test --workspace` (via `docker compose -f docker-compose.test.yml
+  run --rm --build tests`, real Postgres 16 container): **54 tests pass, 0
+  failures** (up from 33 before this pass).
+  `lore-authz-server` unit tests: **30** (up from 13 -- added 7 in
+  `service_auth::tests` and 10 in `grpc::tests`: 2 unauthenticated-deny, 2
+  wrong-token-deny, 2 unconfigured-gate-deny, 3 resource_id format
+  validation, 1 direct `validate_new_resource_id` check; the 2 pre-existing
+  "Postgres not configured" tests were updated to present a valid service
+  token so they still isolate the DB-unconfigured path specifically).
+  `tests/lore_compat.rs`: 4, unchanged.
+  `tests/postgres_backed.rs`: **20** (up from 16 -- added
+  `rebac_create_resource_denies_unauthenticated_caller_against_real_db`,
+  `rebac_delete_resource_denies_unauthenticated_caller_against_real_db`,
+  `rebac_create_resource_denies_wrong_service_token_against_real_db`,
+  `rebac_create_resource_rejects_wildcard_sentinel_against_real_db`; the
+  `Harness` and its `create_resource` helper, plus the two pre-existing
+  idempotency tests, were updated to present `TEST_REBAC_SERVICE_TOKEN` via
+  the new `rebac_request` helper so they keep passing under the new gate).
+- `cargo fmt --all -- --check`: clean (one `cargo fmt --all` pass applied
+  first; whitespace/line-wrap only in `grpc.rs`, `service_auth.rs`, and
+  `tests/postgres_backed.rs`, no logic changed).
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean. One real
+  fix required along the way (not a lint-only change): the first draft used
+  `ring::constant_time::verify_slices_are_equal`, which compiled but is
+  `#[deprecated]` in the pinned `ring` version ("Internal function not
+  intended for external use with no promises regarding side channels") and
+  would have failed this exact check -- replaced with a small hand-rolled
+  constant-time XOR-accumulate comparison (`service_auth::
+  constant_time_eq`), avoiding both the deprecation and a new dependency.
+
+Also verified this pass: `git status --short` (see below); a repo-wide
+non-ASCII scan of every changed file (clean); a grep for embargo-sensitive
+terms, the operator's real name (a fixed placeholder string, not spelled
+out here on purpose), drive-letter paths, and real key material across
+every changed file (zero hits beyond the pre-existing PEM-marker string
+literals, not real key material); `proto/vendor/SHA256SUMS`
+untouched (no proto changes this pass).

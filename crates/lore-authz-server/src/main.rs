@@ -72,6 +72,22 @@ async fn main() -> anyhow::Result<()> {
         Some(Arc::new(db))
     };
 
+    // Security review remediation (see tasks.md, docs/open-questions.md
+    // Q6): RebacApi::CreateResource/DeleteResource fail closed with
+    // Status::unauthenticated on every call when REBAC_SERVICE_TOKEN is not
+    // set, exactly like the DATABASE_URL warning above -- an operator who
+    // has not configured this should see it in the startup log, not
+    // discover it as a silent "everything is denied" surprise (or, worse,
+    // never discover the ALTERNATIVE: an unconfigured gate that defaults to
+    // allow).
+    if config.rebac_service_token.is_none() {
+        warn!(
+            "REBAC_SERVICE_TOKEN is not set: RebacApi::CreateResource/DeleteResource will deny \
+             every caller with Unauthenticated until it is configured -- see \
+             docs/configuration.md"
+        );
+    }
+
     info!(
         grpc = %config.grpc_listen_addr,
         http = %config.http_listen_addr,
@@ -96,7 +112,10 @@ async fn main() -> anyhow::Result<()> {
             jwt_issuer: config.jwt_issuer.clone(),
             jwt_audience: config.jwt_audience.clone(),
         }))
-        .add_service(RebacApiServer::new(RebacApiService { db: db.clone() }))
+        .add_service(RebacApiServer::new(RebacApiService {
+            db: db.clone(),
+            rebac_service_token: config.rebac_service_token.clone(),
+        }))
         .serve(config.grpc_listen_addr);
 
     let app_state = AppState { signing_keys };

@@ -21,8 +21,10 @@ use tonic::Status;
 use crate::caller;
 use crate::db::Db;
 use crate::db::permissions::PgPolicyStore;
+use crate::db::permissions::WILDCARD_RESOURCE_PATTERN;
 use crate::db::principals;
 use crate::db::resources;
+use crate::service_auth;
 use crate::signing::SigningKeyStore;
 
 fn resource_permission_to_wire(
@@ -360,6 +362,12 @@ pub struct RebacApiService {
     /// Same "fail closed with `failed_precondition` when unconfigured" shape
     /// as `AuthApiService::db` above.
     pub db: Option<Arc<Db>>,
+    /// Shared secret gating both RPCs on this service -- see
+    /// `crate::service_auth` for the mechanism and why it fits this hop
+    /// (lore-server, not a user, is the caller here), and
+    /// `docs/open-questions.md` Q6/Q12 for the finding this closes. `None`
+    /// means every call is denied: see `Self::authorize_caller`.
+    pub rebac_service_token: Option<String>,
 }
 
 impl RebacApiService {
@@ -370,6 +378,54 @@ impl RebacApiService {
             )
         })
     }
+
+    /// Gates BOTH `create_resource` and `delete_resource` on the configured
+    /// `REBAC_SERVICE_TOKEN`. Checked before `require_db` deliberately: an
+    /// unauthenticated caller should learn nothing about this service's
+    /// Postgres configuration state.
+    fn authorize_caller<T>(&self, request: &Request<T>) -> Result<(), Status> {
+        service_auth::verify_rebac_caller(
+            authorization_header(request).as_deref(),
+            self.rebac_service_token.as_deref(),
+        )
+    }
+}
+
+/// Rejects a `resource_id` that is not a well-formed `"urc-<id>"` value, and
+/// -- the LOW finding from the security review this pass closes -- explicitly
+/// rejects the literal wildcard sentinel `WILDCARD_RESOURCE_PATTERN`
+/// (`"urc-*"`) itself: that string is reserved for `role_bindings.
+/// resource_pattern` wildcard GRANTS (see `crate::db::permissions`), never a
+/// real resource row. Letting it through `CreateResource` would create a
+/// resource whose id is indistinguishable from the wildcard pattern to any
+/// code that compares the two as plain strings.
+fn validate_new_resource_id(resource_id: &str) -> Result<(), Status> {
+    if resource_id.is_empty() {
+        return Err(Status::invalid_argument("resource_id must not be empty"));
+    }
+    if resource_id == WILDCARD_RESOURCE_PATTERN {
+        return Err(Status::invalid_argument(format!(
+            "resource_id must not be the wildcard sentinel {WILDCARD_RESOURCE_PATTERN:?} -- \
+             that value is reserved for role_bindings.resource_pattern wildcard grants, never a \
+             real resource row"
+        )));
+    }
+    let suffix = resource_id.strip_prefix("urc-").ok_or_else(|| {
+        Status::invalid_argument(format!(
+            "resource_id {resource_id:?} does not match the required \"urc-<id>\" convention"
+        ))
+    })?;
+    let suffix_is_well_formed = !suffix.is_empty()
+        && suffix
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if !suffix_is_well_formed {
+        return Err(Status::invalid_argument(format!(
+            "resource_id {resource_id:?} suffix must be non-empty ASCII alphanumeric \
+             (plus '-'/'_')"
+        )));
+    }
+    Ok(())
 }
 
 #[tonic::async_trait]
@@ -379,22 +435,20 @@ impl rebac::rebac_api_server::RebacApi for RebacApiService {
     // `repository_create_auth_resource` call site treats as a successful
     // create, not an error (see the fork's `repository_create.rs`).
     //
-    // Design plan Q6 (UNVERIFIED whether lore-server sends a meaningful
-    // authorization header on this hop at all) is NOT resolved by this
-    // pass: no caller-identity check is performed here, matching the design
-    // plan's own recommendation to gate this hop at the network layer
-    // (mTLS / shared secret) rather than a user token, since there is no
-    // evidence lore-server ever sends one worth decoding. This is an
-    // explicit, documented gap, not an oversight -- see tasks.md "PHASE 1a".
+    // Security review remediation (see tasks.md, docs/open-questions.md Q6):
+    // gated on `Self::authorize_caller` (`REBAC_SERVICE_TOKEN`, fail closed)
+    // before touching Postgres at all, closing the "anything that can reach
+    // the gRPC port can create/delete resource rows" finding. `resource_id`
+    // is also format-validated, rejecting the literal wildcard sentinel
+    // (`validate_new_resource_id`, the LOW finding from the same review).
     async fn create_resource(
         &self,
         request: Request<rebac::CreateResourceRequest>,
     ) -> Result<Response<rebac::CreateResourceResponse>, Status> {
-        let db = self.require_db()?;
+        self.authorize_caller(&request)?;
         let req = request.into_inner();
-        if req.resource_id.is_empty() {
-            return Err(Status::invalid_argument("resource_id must not be empty"));
-        }
+        validate_new_resource_id(&req.resource_id)?;
+        let db = self.require_db()?;
 
         match resources::create_resource(db.pool(), &req.resource_id, &req.resource_name).await {
             Ok(resources::CreateResourceOutcome::Created) => {
@@ -412,17 +466,22 @@ impl rebac::rebac_api_server::RebacApi for RebacApiService {
 
     // PHASE 1a (see tasks.md). Idempotent: deleting a resource that is
     // already deleted, or never existed, is not an error (see
-    // `db::resources::delete_resource`'s doc comment). Same
-    // no-caller-identity-check gap as `create_resource` above.
+    // `db::resources::delete_resource`'s doc comment). Security review
+    // remediation (see tasks.md, docs/open-questions.md Q6): same
+    // `Self::authorize_caller` gate as `create_resource` above -- this was
+    // the RPC the review's concrete exploit scenario used (mass-revoking
+    // every repository's authorization by iterating the predictable
+    // `urc-{repository_id}` convention with zero credentials).
     async fn delete_resource(
         &self,
         request: Request<rebac::DeleteResourceRequest>,
     ) -> Result<Response<rebac::DeleteResourceResponse>, Status> {
-        let db = self.require_db()?;
+        self.authorize_caller(&request)?;
         let req = request.into_inner();
         if req.resource_id.is_empty() {
             return Err(Status::invalid_argument("resource_id must not be empty"));
         }
+        let db = self.require_db()?;
 
         resources::delete_resource(db.pool(), &req.resource_id)
             .await
@@ -492,13 +551,55 @@ mod tests {
         assert_eq!(err.code(), Code::FailedPrecondition);
     }
 
+    const TEST_REBAC_SERVICE_TOKEN: &str = "test-only-shared-secret-do-not-use-in-prod";
+
+    fn rebac_service_with_token() -> RebacApiService {
+        RebacApiService {
+            db: None,
+            rebac_service_token: Some(TEST_REBAC_SERVICE_TOKEN.to_string()),
+        }
+    }
+
+    fn rebac_service_without_token() -> RebacApiService {
+        RebacApiService {
+            db: None,
+            rebac_service_token: None,
+        }
+    }
+
+    fn authorized_request<T>(body: T) -> Request<T> {
+        let mut req = Request::new(body);
+        req.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {TEST_REBAC_SERVICE_TOKEN}")
+                .parse()
+                .unwrap(),
+        );
+        req
+    }
+
+    fn create_request(resource_id: &str) -> rebac::CreateResourceRequest {
+        rebac::CreateResourceRequest {
+            resource_id: resource_id.to_string(),
+            resource_name: "test".to_string(),
+        }
+    }
+
+    fn delete_request(resource_id: &str) -> rebac::DeleteResourceRequest {
+        rebac::DeleteResourceRequest {
+            resource_id: resource_id.to_string(),
+        }
+    }
+
+    /// With a valid service token presented, `require_db`'s
+    /// `FailedPrecondition` is still the real production early-return path
+    /// when `DATABASE_URL` is not configured -- this proves the new
+    /// caller-identity gate does not paper over that existing fail-closed
+    /// behavior, just runs before it.
     #[tokio::test]
     async fn create_resource_without_configured_postgres_fails_closed() {
-        let service = RebacApiService { db: None };
-        let request = Request::new(rebac::CreateResourceRequest {
-            resource_id: "urc-abc".to_string(),
-            resource_name: "abc".to_string(),
-        });
+        let service = rebac_service_with_token();
+        let request = authorized_request(create_request("urc-abc"));
 
         let err = rebac::rebac_api_server::RebacApi::create_resource(&service, request)
             .await
@@ -508,14 +609,132 @@ mod tests {
 
     #[tokio::test]
     async fn delete_resource_without_configured_postgres_fails_closed() {
-        let service = RebacApiService { db: None };
-        let request = Request::new(rebac::DeleteResourceRequest {
-            resource_id: "urc-abc".to_string(),
-        });
+        let service = rebac_service_with_token();
+        let request = authorized_request(delete_request("urc-abc"));
 
         let err = rebac::rebac_api_server::RebacApi::delete_resource(&service, request)
             .await
             .expect_err("must fail closed, not panic or allow, when Postgres is unconfigured");
         assert_eq!(err.code(), Code::FailedPrecondition);
+    }
+
+    // --- RebacApi caller-identity gate (security review remediation, see
+    // tasks.md and docs/open-questions.md Q6) --------------------------
+
+    #[tokio::test]
+    async fn create_resource_denies_unauthenticated_caller() {
+        let service = rebac_service_with_token();
+        let request = Request::new(create_request("urc-abc")); // no authorization metadata
+
+        let err = rebac::rebac_api_server::RebacApi::create_resource(&service, request)
+            .await
+            .expect_err("an unauthenticated caller must be denied");
+        assert_eq!(err.code(), Code::Unauthenticated);
+    }
+
+    #[tokio::test]
+    async fn delete_resource_denies_unauthenticated_caller() {
+        let service = rebac_service_with_token();
+        let request = Request::new(delete_request("urc-abc")); // no authorization metadata
+
+        let err = rebac::rebac_api_server::RebacApi::delete_resource(&service, request)
+            .await
+            .expect_err("an unauthenticated caller must be denied");
+        assert_eq!(err.code(), Code::Unauthenticated);
+    }
+
+    #[tokio::test]
+    async fn create_resource_denies_wrong_service_token() {
+        let service = rebac_service_with_token();
+        let mut request = Request::new(create_request("urc-abc"));
+        request
+            .metadata_mut()
+            .insert("authorization", "Bearer wrong-secret".parse().unwrap());
+
+        let err = rebac::rebac_api_server::RebacApi::create_resource(&service, request)
+            .await
+            .expect_err("a wrong service token must be denied");
+        assert_eq!(err.code(), Code::Unauthenticated);
+    }
+
+    #[tokio::test]
+    async fn delete_resource_denies_wrong_service_token() {
+        let service = rebac_service_with_token();
+        let mut request = Request::new(delete_request("urc-abc"));
+        request
+            .metadata_mut()
+            .insert("authorization", "Bearer wrong-secret".parse().unwrap());
+
+        let err = rebac::rebac_api_server::RebacApi::delete_resource(&service, request)
+            .await
+            .expect_err("a wrong service token must be denied");
+        assert_eq!(err.code(), Code::Unauthenticated);
+    }
+
+    /// The single most important case: an OPERATOR who never set
+    /// `REBAC_SERVICE_TOKEN` must get a hard deny on every call, never a
+    /// silent allow -- this is the exact failure mode the security review
+    /// flagged as the worst possible outcome.
+    #[tokio::test]
+    async fn create_resource_denies_when_gate_is_unconfigured_even_with_a_presented_token() {
+        let service = rebac_service_without_token();
+        let request = authorized_request(create_request("urc-abc"));
+
+        let err = rebac::rebac_api_server::RebacApi::create_resource(&service, request)
+            .await
+            .expect_err("an unconfigured gate must deny, never default-allow");
+        assert_eq!(err.code(), Code::Unauthenticated);
+    }
+
+    #[tokio::test]
+    async fn delete_resource_denies_when_gate_is_unconfigured_even_with_a_presented_token() {
+        let service = rebac_service_without_token();
+        let request = authorized_request(delete_request("urc-abc"));
+
+        let err = rebac::rebac_api_server::RebacApi::delete_resource(&service, request)
+            .await
+            .expect_err("an unconfigured gate must deny, never default-allow");
+        assert_eq!(err.code(), Code::Unauthenticated);
+    }
+
+    // --- resource_id format validation (LOW finding, same review) -------
+
+    #[tokio::test]
+    async fn create_resource_rejects_wildcard_sentinel_resource_id() {
+        let service = rebac_service_with_token();
+        let request = authorized_request(create_request(WILDCARD_RESOURCE_PATTERN));
+
+        let err = rebac::rebac_api_server::RebacApi::create_resource(&service, request)
+            .await
+            .expect_err("the literal wildcard sentinel must never be accepted as a resource_id");
+        assert_eq!(err.code(), Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn create_resource_rejects_resource_id_missing_urc_prefix() {
+        let service = rebac_service_with_token();
+        let request = authorized_request(create_request("not-the-right-prefix-abc"));
+
+        let err = rebac::rebac_api_server::RebacApi::create_resource(&service, request)
+            .await
+            .expect_err("a resource_id not matching the urc-<id> convention must be rejected");
+        assert_eq!(err.code(), Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn create_resource_rejects_empty_suffix_after_prefix() {
+        let service = rebac_service_with_token();
+        let request = authorized_request(create_request("urc-"));
+
+        let err = rebac::rebac_api_server::RebacApi::create_resource(&service, request)
+            .await
+            .expect_err("urc- with nothing after it must be rejected");
+        assert_eq!(err.code(), Code::InvalidArgument);
+    }
+
+    #[test]
+    fn validate_new_resource_id_accepts_well_formed_ids() {
+        assert!(validate_new_resource_id("urc-abc123").is_ok());
+        assert!(validate_new_resource_id("urc-0194b726b34e72b0b45550b88a967076").is_ok());
     }
 }

@@ -88,6 +88,12 @@ use uuid::Uuid;
 
 const ISSUER: &str = "https://authz.example.com";
 
+/// Shared secret gating `RebacApi` in these tests -- see
+/// `crates/lore-authz-server/src/service_auth.rs` and
+/// `docs/open-questions.md` Q6 for why this hop uses a static shared secret
+/// rather than the user bearer-JWT path `crate::caller` verifies.
+const TEST_REBAC_SERVICE_TOKEN: &str = "test-only-shared-secret-do-not-use-in-prod";
+
 fn audience() -> Vec<String> {
     vec!["lore.example.com".to_string()]
 }
@@ -133,6 +139,7 @@ impl Harness {
         };
         let rebac_service = RebacApiService {
             db: Some(db.clone()),
+            rebac_service_token: Some(TEST_REBAC_SERVICE_TOKEN.to_string()),
         };
         Self {
             db,
@@ -175,9 +182,26 @@ impl Harness {
         req
     }
 
+    /// Wraps a `RebacApi` request with the shared-secret bearer this
+    /// harness's `rebac_service` was configured with -- see
+    /// `TEST_REBAC_SERVICE_TOKEN` and `crate::service_auth`. Distinct from
+    /// `request_with_bearer` above (which mints a user AuthZ/AuthN token):
+    /// `RebacApi`'s caller is lore-server itself, not a user, so it is
+    /// gated by a different mechanism entirely.
+    fn rebac_request<T>(&self, body: T) -> Request<T> {
+        let mut req = Request::new(body);
+        req.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {TEST_REBAC_SERVICE_TOKEN}")
+                .parse()
+                .unwrap(),
+        );
+        req
+    }
+
     async fn create_resource(&self, resource_id: &str) {
         self.rebac_service
-            .create_resource(Request::new(rebac::CreateResourceRequest {
+            .create_resource(self.rebac_request(rebac::CreateResourceRequest {
                 resource_id: resource_id.to_string(),
                 resource_name: resource_id.to_string(),
             }))
@@ -682,7 +706,7 @@ async fn create_resource_is_idempotent() {
     // handled -- assert directly here instead, to check the actual code.
     let status = h
         .rebac_service
-        .create_resource(Request::new(rebac::CreateResourceRequest {
+        .create_resource(h.rebac_request(rebac::CreateResourceRequest {
             resource_id: "urc-idem".to_string(),
             resource_name: "urc-idem".to_string(),
         }))
@@ -717,14 +741,14 @@ async fn delete_resource_revokes_access_and_is_idempotent() {
     assert_eq!(resp.allowed_resource_permission.len(), 1);
 
     h.rebac_service
-        .delete_resource(Request::new(rebac::DeleteResourceRequest {
+        .delete_resource(h.rebac_request(rebac::DeleteResourceRequest {
             resource_id: "urc-todelete".to_string(),
         }))
         .await
         .expect("delete_resource");
     // Idempotent: deleting again must not error.
     h.rebac_service
-        .delete_resource(Request::new(rebac::DeleteResourceRequest {
+        .delete_resource(h.rebac_request(rebac::DeleteResourceRequest {
             resource_id: "urc-todelete".to_string(),
         }))
         .await
@@ -748,6 +772,96 @@ async fn delete_resource_revokes_access_and_is_idempotent() {
         "a deleted resource must no longer be accessible even to a principal with a standing grant"
     );
     assert_eq!(resp.denied_resource_permission.len(), 1);
+}
+
+// --- RebacApi caller-identity gate, end to end against a REAL Postgres-
+// backed service (see crates/lore-authz-server/src/service_auth.rs and
+// docs/open-questions.md Q6). `create_resource_is_idempotent` and
+// `delete_resource_revokes_access_and_is_idempotent` above already prove the
+// "valid credential ALLOWED" case for real (they run through `h.rebac_
+// request`, which presents the correct shared secret, and succeed all the
+// way through to real Postgres rows). These tests prove the deny paths are
+// equally real against the same live service, not just at the grpc.rs unit
+// level with db: None.
+
+#[tokio::test]
+async fn rebac_create_resource_denies_unauthenticated_caller_against_real_db() {
+    let h = Harness::new().await;
+    let err = h
+        .rebac_service
+        .create_resource(Request::new(rebac::CreateResourceRequest {
+            resource_id: "urc-noauth".to_string(),
+            resource_name: "urc-noauth".to_string(),
+        }))
+        .await
+        .expect_err("no authorization metadata at all must be denied");
+    assert_eq!(err.code(), Code::Unauthenticated);
+}
+
+#[tokio::test]
+async fn rebac_delete_resource_denies_unauthenticated_caller_against_real_db() {
+    let h = Harness::new().await;
+    h.create_resource("urc-stillthere").await;
+
+    let err = h
+        .rebac_service
+        .delete_resource(Request::new(rebac::DeleteResourceRequest {
+            resource_id: "urc-stillthere".to_string(),
+        }))
+        .await
+        .expect_err("no authorization metadata at all must be denied");
+    assert_eq!(err.code(), Code::Unauthenticated);
+
+    // And the resource must genuinely still exist -- the denied delete must
+    // not have taken effect.
+    let user = Uuid::new_v4();
+    h.create_user(user, "Ivan").await;
+    h.grant_wildcard(ROLE_READER, "user", user).await;
+    let resp = h
+        .auth_service
+        .check_user_permission(h.request_with_bearer(
+            epic_urc::CheckUserPermissionRequest {
+                resource_id: vec!["urc-stillthere".to_string()],
+                target_user: None,
+            },
+            user,
+        ))
+        .await
+        .expect("check_user_permission")
+        .into_inner();
+    assert_eq!(resp.allowed_resource_permission.len(), 1);
+}
+
+#[tokio::test]
+async fn rebac_create_resource_denies_wrong_service_token_against_real_db() {
+    let h = Harness::new().await;
+    let mut req = Request::new(rebac::CreateResourceRequest {
+        resource_id: "urc-wrongtoken".to_string(),
+        resource_name: "urc-wrongtoken".to_string(),
+    });
+    req.metadata_mut()
+        .insert("authorization", "Bearer definitely-wrong".parse().unwrap());
+
+    let err = h
+        .rebac_service
+        .create_resource(req)
+        .await
+        .expect_err("a wrong shared secret must be denied");
+    assert_eq!(err.code(), Code::Unauthenticated);
+}
+
+#[tokio::test]
+async fn rebac_create_resource_rejects_wildcard_sentinel_against_real_db() {
+    let h = Harness::new().await;
+    let err = h
+        .rebac_service
+        .create_resource(h.rebac_request(rebac::CreateResourceRequest {
+            resource_id: lore_authz_server::db::permissions::WILDCARD_RESOURCE_PATTERN.to_string(),
+            resource_name: "should-never-be-created".to_string(),
+        }))
+        .await
+        .expect_err("the literal wildcard sentinel must never be creatable as a real resource");
+    assert_eq!(err.code(), Code::InvalidArgument);
 }
 
 #[tokio::test]

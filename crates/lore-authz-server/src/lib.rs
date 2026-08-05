@@ -10,4 +10,5 @@ pub mod db;
 pub mod grpc;
 pub mod http;
 pub mod minting;
+pub mod service_auth;
 pub mod signing;

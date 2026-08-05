@@ -20,6 +20,7 @@ Every value in `.env.example` is a placeholder. Never commit a real `.env`
 | `AUTHZ_TOKEN_TTL_SECS` | no | `3600` (1h) | AuthZ token lifetime. Keep short: see the stateless-revocation-window note in `docs/protocol-notes.md`. |
 | `SIGNING_KEY_SOURCE` | no | `file:///CHANGE_ME/signing-key.der` | Phase 0: a `file://` unencrypted PKCS#8 EC P-256 private key, PEM or raw DER (NOT a JWK -- see `crates/lore-authz-server/src/signing.rs`). If the file does not exist, an ephemeral dev key is generated in memory and a warning is logged. Phase 1+: real key management. |
 | `JWKS_PATH` | no | `/.well-known/jwks.json` | Path on the HTTP listener to serve this service's own JWKS on. |
+| `REBAC_SERVICE_TOKEN` | **yes, effectively** | (none) | Shared secret gating `RebacApi::CreateResource`/`DeleteResource` (security review remediation -- see `docs/open-questions.md` Q6). Present as `authorization: Bearer <value>` on those two RPCs only; unrelated to `JWT_ISSUER`/`JWT_AUDIENCE` and not a JWT. **Unset means both RPCs deny every caller** with `Status::unauthenticated` (`crates/lore-authz-server/src/service_auth.rs`) -- a deliberate fail-closed default, not a bug. See the dedicated section below for the honest gap this does and does not close. |
 | `GRPC_LISTEN_ADDR` | no | `0.0.0.0:8443` | `UrcAuthApi` + `RebacApi`. Must be reachable over TLS trusted by the lore CLI's native roots in any real deployment. |
 | `HTTP_LISTEN_ADDR` | no | `0.0.0.0:8080` | JWKS, login, OIDC/SAML callbacks, health, metrics. |
 | `OIDC_ISSUER_URL` / `OIDC_CLIENT_ID` / `OIDC_CLIENT_SECRET` / `OIDC_REDIRECT_URL` | Phase 1 | (none) | Single-tenant local-dev bring-up. Multi-IdP deployments configure `idp_connections` in the database instead. |
@@ -34,3 +35,39 @@ setting it in any real deployment: the lore CLI validates `aud` against the
 lore SERVER's own domain **client-side**, independently of whatever
 `lore-server`'s own `auth.jwt_audience` config accepts. The simplest correct
 configuration sets both to the lore server's root domain.
+
+## `REBAC_SERVICE_TOKEN`: what it closes, and what it honestly does not
+
+A security review found `RebacApi::CreateResource`/`DeleteResource`
+performed NO caller-identity check at all: anything that could reach the
+gRPC port could create or delete resource rows, including mass-revoking
+every repository's authorization by iterating the predictable
+`urc-{repository_id}` convention with `DeleteResource` and zero credentials.
+`REBAC_SERVICE_TOKEN` closes that: both RPCs now require
+`authorization: Bearer <REBAC_SERVICE_TOKEN>` and fail closed
+(`Status::unauthenticated`) on anything else, INCLUDING the value being
+unset -- see `crates/lore-authz-server/src/service_auth.rs` for the
+mechanism and full reasoning.
+
+Why a shared secret and not the same bearer-JWT check
+`crates/lore-authz-server/src/caller.rs` uses for `LookupUserPermissions`/
+`CheckUserPermission`: `lore-server` is the caller on this hop, not an end
+user, and reading the pinned fork's actual client code
+(`lore-server/src/authnz/rebac.rs`'s `RebacClientHelper`) confirms it
+attaches no bearer token, and no client TLS identity, to these calls --
+only a correlation-id interceptor for tracing. There is nothing for a
+JWT-verification check to verify here; a shared secret matches what the
+design plan itself recommends for this hop (mTLS or a shared secret, not a
+user token) and is the smaller, more auditable surface of the two.
+
+**The honest gap**: the pinned/unmodified upstream `lore-server` binary this
+project integrates against does not send `REBAC_SERVICE_TOKEN` (or any
+credential) on this hop today, because it has no config surface to do so.
+Setting this variable is therefore a real deployment requirement, not a
+config flip you do in isolation: something on the network path between
+`lore-server` and this service's gRPC port has to attach the header --
+typically a sidecar or reverse proxy the operator controls, since
+`lore-server`'s own `auth_url` does not have to point directly at this
+service's raw listener. Making `lore-server` itself send this header is a
+change to a different repository (`epic-lore`), out of scope for this
+project. See `docs/open-questions.md` Q6 for the full writeup.

@@ -83,6 +83,15 @@ pub struct Config {
     /// Behind the `saml` cargo feature in Phase 2; see design plan section D.
     pub saml_sp_entity_id: Option<String>,
     pub saml_idp_metadata_url: Option<String>,
+
+    /// Shared secret gating `RebacApi::CreateResource`/`DeleteResource` --
+    /// see `crate::service_auth` for why this mechanism (not the user
+    /// bearer-JWT path `crate::caller` uses) fits this hop, and
+    /// `docs/open-questions.md` Q6/Q12 for the finding this closes.
+    /// `None` (unset) means those two RPCs deny every caller: see
+    /// `crate::service_auth::verify_rebac_caller`. This is a deliberate
+    /// fail-closed default, not a missing feature.
+    pub rebac_service_token: Option<String>,
 }
 
 fn env_var(key: &str) -> Result<String, anyhow::Error> {
@@ -129,6 +138,7 @@ impl Config {
             oidc_redirect_url: env_var_opt("OIDC_REDIRECT_URL"),
             saml_sp_entity_id: env_var_opt("SAML_SP_ENTITY_ID"),
             saml_idp_metadata_url: env_var_opt("SAML_IDP_METADATA_URL"),
+            rebac_service_token: env_var_opt("REBAC_SERVICE_TOKEN"),
         })
     }
 }
