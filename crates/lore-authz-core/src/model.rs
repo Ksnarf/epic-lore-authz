@@ -59,11 +59,24 @@ pub enum PrincipalStatus {
 /// A user OR a service account. Both live in one id space (see design plan
 /// section C) so `GetUserInfo`/`GetUserId` work uniformly and `sub` in every
 /// token is always a `Principal.id`.
+///
+/// `external_id` / `source` / `status` are populated starting PHASE 1a (see
+/// tasks.md) so that SCIM provisioning (Phase 3) is purely additive later --
+/// no migration is needed to add these columns retroactively. Nothing
+/// populates `external_id` yet (no SCIM client exists); `source` defaults to
+/// `"local"` for every principal created so far.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Principal {
     pub id: Uuid,
     pub idp_connection_id: Option<Uuid>,
     pub subject: String,
+    /// The identity's id in whatever external system `source` names (e.g. a
+    /// SCIM `externalId`). `None` until a Phase 3 SCIM client sets it.
+    pub external_id: Option<String>,
+    /// Where this principal was provisioned from: `"local"` (Phase 1a
+    /// manual/test provisioning), `"oidc"` (Phase 1b JIT), or `"scim"`
+    /// (Phase 3). Advisory/audit only; nothing branches on it yet.
+    pub source: String,
     pub email: Option<String>,
     pub display_name: String,
     pub preferred_username: String,
@@ -71,11 +84,16 @@ pub struct Principal {
     pub status: PrincipalStatus,
 }
 
+/// Same `external_id` / `source` / `status` rationale as `Principal` above --
+/// SCIM group provisioning (Phase 3) should be additive, not a migration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Group {
     pub id: Uuid,
     pub name: String,
     pub description: Option<String>,
+    pub external_id: Option<String>,
+    pub source: String,
+    pub status: PrincipalStatus,
 }
 
 /// Populated by `RebacApi::CreateResource` / `DeleteResource`. `resource_id`
@@ -105,13 +123,23 @@ pub enum PrincipalType {
     ServiceAccount,
 }
 
-/// The single table the token minter reads to build the `resources` claim.
-/// `resource_id: None` means "all repositories" (mints as `urc-*`).
+/// The single table the token minter reads to build the `resources` claim,
+/// and (PHASE 1a, see tasks.md) the table `LookupUserPermissions` /
+/// `CheckUserPermission` read to answer "what can this principal see".
+///
+/// `resource_pattern` is always a literal string, never `None`: either a
+/// specific `urc-{repository_id}` or the literal wildcard `urc-*`, which a
+/// grant honors as matching ANY `urc-*` resource (see tasks.md "PHASE 1a" --
+/// this replaced an earlier `Option<String>` sketch where `None` meant "all
+/// repositories"; storing the literal wildcard string instead means a row
+/// read straight out of this table is already in the exact shape
+/// `ResourcePermission::matches_repository` checks against, with no `None`
+/// special case to keep in sync).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoleBinding {
     pub id: Uuid,
     pub role_id: Uuid,
-    pub resource_id: Option<String>,
+    pub resource_pattern: String,
     pub principal_type: PrincipalType,
     pub principal_id: Uuid,
 }

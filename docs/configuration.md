@@ -11,8 +11,8 @@ Every value in `.env.example` is a placeholder. Never commit a real `.env`
 
 | Variable | Required | Default | Notes |
 |---|---|---|---|
-| `DATABASE_URL` | Phase 1+ | (none) | Standard Postgres connection string. Not read in the Phase 0 in-memory bring-up. |
-| `DB_SCHEMA` | no | `loreauth` | This product owns exactly one schema; never `public`, never a dedicated database, never superuser. |
+| `DATABASE_URL` | PHASE 1a | (none) | Standard Postgres connection string. Required for `LookupUserPermissions`, `CheckUserPermission`, and `RebacApi::CreateResource`/`DeleteResource` to do anything but fail closed with `Status::failed_precondition` (see `main.rs`); everything else in this scaffold has no Postgres dependency. |
+| `DB_SCHEMA` | no | `loreauth` | This product owns exactly one schema; never `public`, never a dedicated database, never superuser. See `docs/data-model.md`. Migrations run automatically at startup against this schema (connecting IS migrating -- there is no separate migrate command). |
 | `JWT_ISSUER` | yes | (none) | `iss` claim on every minted token. |
 | `JWT_AUDIENCE` | yes | (none) | Comma-separated root domains. Must include the lore server's own root domain -- see `docs/protocol-notes.md` section 3. |
 | `TOKEN_ENV` | no | `dev` | Value placed in the `env` claim of every minted token. Required by lore-server on both claim shapes -- see `docs/protocol-notes.md` section 2. |

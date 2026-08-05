@@ -453,3 +453,236 @@ changes (`docker/Dockerfile.build`, Docker via PowerShell):
   not a `cargo test`).
 - `cargo fmt --all -- --check`: clean.
 - `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+
+## PHASE 1a - LookupUserPermissions, CheckUserPermission, RebacApi (2026-08-05)
+
+A deliberate re-slice ahead of the rest of Phase 1: implements exactly the
+four RPCs lore-server was observed to call on the wire during Phase 0
+integration testing (`RepositoryList` -> `LookupUserPermissions`,
+`RepositoryQuery`/`RepositoryGet` -> `CheckUserPermission`,
+`RepositoryCreate`/`RepositoryDelete` -> `RebacApi::CreateResource`/
+`DeleteResource` -- see `docs/open-questions.md` Q4, now SETTLED), backed by
+real Postgres. Everything else in Phase 0/Phase 1 (`StartAuthSession`,
+`GetAuthSession`, `ExchangeUserTokenForMultiresourceToken`, OIDC, SAML)
+is deliberately untouched and remains `Status::unimplemented` -- Phase 1b.
+
+- [x] Postgres schema + `DB_SCHEMA`-scoped, idempotent migrations.
+      [verified-e2e] `crates/lore-authz-server/migrations/
+      0001_identities_resources_grants.sql`: `principals`, `groups`,
+      `group_members`, `resources`, `roles`, `role_permissions`-equivalent
+      (a `permissions text[]` column on `roles`), `role_bindings`. Every
+      pooled connection gets `search_path` set to `DB_SCHEMA` in
+      `after_connect` (`crates/lore-authz-server/src/db/mod.rs`), so the
+      migration SQL is deliberately schema-unqualified; `DB_SCHEMA` is
+      validated (`validate_schema_identifier`) to reject `public` and
+      anything that is not a plain lowercase SQL identifier before any DDL
+      runs. Migrations run automatically at process startup
+      (`Db::connect` -> `db.migrate()` in `main.rs`) via `sqlx::migrate!`,
+      which tracks its own history table inside `DB_SCHEMA`; there is no
+      separate migrate command. Idempotency proven for real by
+      `tests/postgres_backed.rs`'s `migrations_are_idempotent`, which
+      re-runs `db.migrate()` against an already-migrated schema and asserts
+      no error. See `docs/data-model.md` for the full schema writeup.
+- [x] `LookupUserPermissions` (real logic, Postgres-backed).
+      [verified-e2e] `crates/lore-authz-server/src/grpc.rs`. Resolves the
+      caller from the `authorization` metadata (`crate::caller`), asks
+      `db::resources::list_resource_ids_with_prefix` for the candidate set
+      matching `resource_filter` (settled as a plain prefix match --
+      `docs/open-questions.md` Q5), then
+      `db::permissions::PgPolicyStore::resolve_resource_permissions` for
+      the effective, currently-authorized subset. A wildcard grant is
+      ALWAYS expanded to concrete, currently-registered resource ids, never
+      returned as the literal string `"urc-*"` -- see
+      `crates/lore-authz-server/src/db/permissions.rs`'s module doc comment
+      for why a literal wildcard entry would be silently dropped by the
+      real call site. Pagination (`page_size`/`page_token`) is implemented
+      (offset-based over the already-resolved set) even though no observed
+      call site uses it.
+- [x] `CheckUserPermission` (real logic, Postgres-backed).
+      [verified-e2e] Same file. Resolves the caller either from
+      `target_user.user_token` (if supplied) or the `authorization`
+      metadata (tested explicitly:
+      `check_user_permission_with_explicit_target_user_token`), then splits
+      `req.resource_id` into `allowed_resource_permission` /
+      `denied_resource_permission` via the same policy engine
+      `LookupUserPermissions` uses. A requested resource_id that does not
+      exist (never created, or soft-deleted) is placed in `denied`, never
+      `allowed`, even under a wildcard `admin` grant -- this was a real bug
+      found and fixed during this pass (see below).
+- [x] `RebacApi::CreateResource` / `DeleteResource` (real logic,
+      Postgres-backed). [verified-e2e] `create_resource` upserts into
+      `resources`; a second call for the same `resource_id` returns
+      `Status::already_exists` (`Code::AlreadyExists`), matching the real
+      fork's `repository_create_auth_resource` call site, which treats
+      `AlreadyExists` as a successful create, not an error. `delete_resource`
+      soft-deletes (`deleted_at = now()`); deleting an already-deleted or
+      never-existing `resource_id` is not an error (0 rows affected is a
+      normal outcome), matching the fork's own delete call site not
+      special-casing not-found. Both tested for idempotency
+      (`create_resource_is_idempotent`,
+      `delete_resource_revokes_access_and_is_idempotent`, the latter also
+      proving a delete actually revokes a standing grant).
+      Design gap left OPEN, not resolved: neither RPC checks caller
+      identity at all (`docs/open-questions.md` Q6) -- matches the design
+      plan's own recommendation to gate this hop with mTLS/a shared secret
+      rather than a user token, since there is still no evidence
+      `lore-server` ever sends one worth decoding, but this means anything
+      that can reach the gRPC port can create/delete resource rows today.
+- [x] Caller identity resolution (`crates/lore-authz-server/src/caller.rs`).
+      [verified-e2e] Verifies a bearer JWT against this server's own active
+      signing key (self-issued only -- no external IdP yet, Phase 1b),
+      recovers the `sub` claim as a `principals.id`. Treats an empty
+      `authorization` value the same as a missing one (per
+      `authnz/common.rs`'s `can_create_request_without_authorization`
+      behavior in the fork). A validly-signed token whose `sub` does not
+      resolve to an `active` row in `principals` denies with
+      `Status::unauthenticated` (`db::principals::find_active_principal`)
+      -- unknown, suspended, and deprovisioned principals are all treated
+      identically: deny.
+- [x] Real bug found and fixed during this pass: the first version of
+      `PgPolicyStore::resolve_resource_permissions` (written before this
+      pass reconciled the two implementations, see the salvage note below)
+      never checked resource EXISTENCE for the `CheckUserPermission` path --
+      only `LookupUserPermissions` pre-filtered candidates through
+      `list_resource_ids_with_prefix` (which already excludes deleted /
+      never-created resources). A wildcard grant therefore authorized ANY
+      requested `resource_id`, including one that was never created or had
+      been deleted. Caught by two tests written for exactly this
+      (`nonexistent_resource_is_denied_not_errored`,
+      `delete_resource_revokes_access_and_is_idempotent`), which failed
+      against the original implementation. Fixed by adding an existence
+      check (`resources` table, `deleted_at IS NULL`) INSIDE the shared
+      `resolve_resource_permissions` method itself, so every future caller
+      (including the still-unbuilt `ExchangeUserTokenForMultiresourceToken`)
+      gets this for free rather than each caller having to remember to
+      pre-filter. See `crates/lore-authz-server/src/db/permissions.rs`.
+- [x] Real Postgres-backed test suite (not sqlite, not a mock).
+      [verified-e2e] `crates/lore-authz-server/tests/postgres_backed.rs`,
+      16 tests, all passing against a real Postgres 16 container (see
+      proof section below). Each test connects with its own randomly-named
+      schema (`test_<uuid>`) inside the same database, proving `DB_SCHEMA`
+      isolation actually works and letting tests run concurrently. Covers
+      every required case: wildcard `urc-*` grant
+      (`wildcard_grant_allows_any_registered_resource`), a specific-resource
+      grant that does not leak to a sibling resource
+      (`specific_repository_grant_does_not_cover_other_repositories`), a
+      user with zero grants (`user_with_no_grants_denies_everything`), a
+      group-inherited grant with no direct binding on the user at all
+      (`group_inherited_grant`), a service account
+      (`service_account_direct_grant`), the EXACT (not superset/subset)
+      scoped set `LookupUserPermissions` must return
+      (`lookup_user_permissions_returns_exact_scoped_set_no_more_no_less`,
+      `lookup_user_permissions_specific_only_does_not_leak_other_resources`),
+      and explicit fail-closed proof for every required error path: unknown
+      resource (`nonexistent_resource_is_denied_not_errored`), unknown
+      principal (`unknown_principal_id_denies_check`,
+      `unknown_principal_id_denies_lookup`), missing bearer token
+      (`missing_bearer_token_is_unauthenticated`), and a REAL simulated DB
+      failure -- the connection pool closed out from under an otherwise
+      fully-authorized request
+      (`database_failure_denies_rather_than_grants`), asserting `Err` with
+      `Code::Internal`, never a permissive `Ok`.
+- [x] `docker-compose.test.yml` at the repo root: a throwaway
+      `postgres:16-alpine` (tmpfs data dir) plus a `tests` service built
+      from the same `docker/Dockerfile.build`. Documented in `README.md`'s
+      new Testing section: `docker compose -f docker-compose.test.yml run
+      --rm --build tests`, then `down -v` to tear down. Never touches a
+      shared database; never `CREATE DATABASE`s.
+      [verified-e2e] run for real this pass (see proof section below).
+- [x] CI: `.github/workflows/ci.yml`'s `build-and-test` job now runs a
+      `postgres:16-alpine` GitHub Actions service container and sets
+      `TEST_DATABASE_URL` for the `cargo test --workspace` step, so
+      `tests/postgres_backed.rs` runs in CI too. [code-says] -- not run
+      (would require a push to GitHub Actions; this repo is commit-only per
+      the task constraints, not pushed).
+- [x] Docs: `docs/open-questions.md` Q4 SETTLED (lore-server does call both
+      RPCs, with the exact call sites cited), Q5 SETTLED for
+      `resource_filter` (plain prefix match) with the wildcard-expansion
+      gotcha documented, Q6 given an explicit "not resolved, only worked
+      around" implementation-status note. New `docs/data-model.md`
+      describing the schema and the shared policy-resolution engine.
+      `docs/configuration.md`'s `DATABASE_URL`/`DB_SCHEMA` rows updated to
+      reflect Phase 1a load-bearing status and the migrate-on-connect
+      design choice. `README.md`'s "What this is NOT" and a new Testing
+      section updated.
+
+**Left open / explicitly out of scope for this pass** (Phase 1b unless
+noted):
+
+- `StartAuthSession`, `GetAuthSession`, `ExchangeUserTokenForMultiresourceToken`,
+  OIDC, SAML: still `Status::unimplemented`, untouched, by design.
+- `GetUserInfo`, `GetUserId`, `GetProviderUserId`,
+  `ExchangeExternalTokenForUserToken`, `ExchangeAPIKeyForUserToken`,
+  `VerifyUser`: still `Status::unimplemented`, untouched.
+- `RebacApi` caller-identity / trust boundary (`docs/open-questions.md` Q6):
+  genuinely unresolved, not just deferred -- needs a real design decision
+  (mTLS, shared secret, or something else) before any real deployment.
+- `LookupUserPermissionsRequest.context_filter`: accepted on the wire, not
+  acted on (no observed call site sets it).
+- `PolicyStore` trait (`lore-authz-core::policy`) is still not implemented
+  by anything -- `CheckUserPermission`/`LookupUserPermissions` are built
+  directly against `db::permissions::PgPolicyStore`'s own inherent methods,
+  which intentionally differ in shape from what the trait's documented
+  sizing-rule contract wants for token minting (a wildcard grant collapses
+  to a single `"urc-*"` entry for token-sizing purposes, but must be
+  expanded to concrete ids for `CheckUserPermission`/`LookupUserPermissions`
+  -- see `docs/data-model.md`). Whoever wires
+  `ExchangeUserTokenForMultiresourceToken` in Phase 1b should read
+  `db/permissions.rs` closely before deciding whether/how to share code
+  with it.
+- Session collision note: this pass started as two independent, concurrent
+  implementations against the same working tree (a coordination error, not
+  a design decision) and was reconciled into the one described above --
+  see `log.log` in the parent `foundation` repo for the incident record.
+  Nothing about the resulting design was compromised by that; noted here
+  only for provenance.
+
+**Proof (this pass, all four checks run for real in the pinned Docker build
+image, `docker/Dockerfile.build`, Docker reached via PowerShell):**
+
+- `cargo build --workspace`: clean, `Finished` dev profile.
+- `cargo test --workspace`: **33 tests pass, 0 failures.**
+  `lore-authz-core` / `lore-authz-proto`: 0 tests (unchanged).
+  `lore-authz-server` unit tests (13): signing (3), caller (4), minting (2),
+  grpc (4, the "Postgres not configured -> `FailedPrecondition`" fail-closed
+  cases for all four PHASE 1a RPCs).
+  `tests/lore_compat.rs` (4): unchanged from Phase 0.
+  `tests/postgres_backed.rs` (16): **all 16 run against a real Postgres 16
+  container** (`docker-compose.test.yml`'s `postgres` service; also
+  reproduced via a standalone `docker compose up -d postgres` +
+  `docker compose run --rm --build tests`). Test names:
+  `wildcard_grant_allows_any_registered_resource`,
+  `specific_repository_grant_does_not_cover_other_repositories`,
+  `user_with_no_grants_denies_everything`, `group_inherited_grant`,
+  `service_account_direct_grant`,
+  `lookup_user_permissions_returns_exact_scoped_set_no_more_no_less`,
+  `lookup_user_permissions_specific_only_does_not_leak_other_resources`,
+  `nonexistent_resource_is_denied_not_errored`,
+  `unknown_principal_id_denies_check`, `unknown_principal_id_denies_lookup`,
+  `missing_bearer_token_is_unauthenticated`,
+  `database_failure_denies_rather_than_grants`,
+  `check_user_permission_with_explicit_target_user_token`,
+  `create_resource_is_idempotent`,
+  `delete_resource_revokes_access_and_is_idempotent`,
+  `migrations_are_idempotent`. (First run, before the existence-check fix
+  above, showed 14/16 passing with `delete_resource_revokes_access_and_is_
+  idempotent` and `nonexistent_resource_is_denied_not_errored` FAILING for
+  the real reason documented above; re-run after the fix: 16/16.)
+- `cargo fmt --all -- --check`: clean (one `cargo fmt --all` pass applied
+  first; whitespace/line-wrap only in `grpc.rs` and `tests/
+  postgres_backed.rs`, no logic changed).
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean (one fix
+  required: `clippy::manual_map` in `grpc.rs`'s `check_user_permission`,
+  rewritten to `user.as_ref().map(...)` per clippy's own suggestion).
+
+Also verified this pass, raw commands not just claimed: `git status --short`
+after committing; `sha256sum proto/vendor/{auth_api,rebac_api}.proto`
+recomputed and diffed byte-for-byte against `proto/vendor/SHA256SUMS`
+(unchanged); a repo-wide non-ASCII scan of every tracked file (clean); a
+grep across every tracked and newly-added file for a fixed set of
+embargo-sensitive terms (not spelled out in this tracked file on purpose),
+plus a real-name placeholder string, any absolute host filesystem path, and
+anything resembling real key material -- zero hits beyond the pre-existing
+PEM-marker string literals `signing.rs` already used to detect key format,
+which are not real key material. See the coordinator's session log for the
+exact commands and their output.

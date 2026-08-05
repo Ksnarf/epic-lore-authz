@@ -61,20 +61,50 @@ currently a no-op ("The correlation ID injection is now a no-op at this
 layer"), so the real CLI does not appear to send it today. See
 `docs/protocol-notes.md` #7d.
 
-## Q4. Does `lore-server` ever actually call `CheckUserPermission` or `LookupUserPermissions`?
+## Q4. Does `lore-server` ever actually call `CheckUserPermission` or `LookupUserPermissions`? (SETTLED)
 
-No call sites were found in the `lore-server` source read while designing
-this project. `lore-server/src/authnz/auth.rs` has client helper wrappers
-for both, but whether anything in `lore-server` actually invokes them is
-unconfirmed. Affects Phase 1 prioritization only -- implement both
-correctly regardless, but do not block Phase 0 on their exact semantics.
+**SETTLED, by reading the fork's real call sites (PHASE 1a, see
+tasks.md): yes, both, unconditionally whenever `auth_url` is configured.**
+`lore-server/src/grpc/handlers/repository_list.rs`'s
+`lookup_authorized_repositories` calls `LookupUserPermissions` to build the
+candidate list for `RepositoryList`; `lore-server/src/grpc/handlers/
+repository_query.rs`'s `check_repository_query_authorization` calls
+`CheckUserPermission` to authorize `RepositoryQuery` (used by both
+`RepositoryGet` and repository-by-name lookups). Neither caller treats
+either RPC as optional or best-effort: both map a `PermissionDenied` /
+`Unauthenticated` response specially, and any other error becomes an
+`Internal` failure of the whole request. This is source-level confirmation
+(the exact request/response shapes each call site sends and reads), not a
+runtime trace against a live `lore-server` process.
 
-## Q5. `resource_filter` / `context_filter` semantics in `LookupUserPermissions`
+## Q5. `resource_filter` / `context_filter` semantics in `LookupUserPermissions` (SETTLED for `resource_filter`)
 
-Undocumented in the proto. Proposal (not yet implemented): support exact
-match, a trailing-`*` prefix match, and `urc-*` meaning "all resources."
-Whatever is implemented, document the chosen interpretation here and in
-user-facing docs, since callers cannot infer it from the proto alone.
+**SETTLED (PHASE 1a): `resource_filter` is a plain prefix match.** The real
+call site (`repository_list::lookup_authorized_repositories`) always sends
+the literal string `"urc"` (not `"urc-"`, not `"urc-*"`), constructed as
+`LookupUserPermissionsRequest { resource_filter: "urc".to_string(),
+..Default::default() }`. This project's implementation
+(`crates/lore-authz-server/src/grpc.rs`'s `normalize_resource_filter`)
+strips a trailing `*` if present and then does a plain prefix match against
+`resources.resource_id` (`db::resources::list_resource_ids_with_prefix`),
+so `"urc"` and `"urc-*"` behave identically and an empty filter matches
+everything -- since every resource this project ever registers is named
+`urc-{repository_id}`, a prefix of `"urc"` matches all of them, exactly
+satisfying the observed call site.
+
+A separate, non-obvious finding from implementing this: a wildcard grant
+(see `db::permissions::WILDCARD_RESOURCE_PATTERN`) is always EXPANDED to
+the concrete, currently-registered resource ids it matches before being
+returned -- never returned as the literal string `"urc-*"` itself. The real
+call site strips the `"urc-"` prefix off each returned `resource_id` and
+parses the remainder directly as a repository id; a literal `"urc-*"` entry
+would fail that parse and simply be dropped, silently returning ZERO
+repositories to a user who should see all of them. See
+`crates/lore-authz-server/src/db/permissions.rs`'s module doc comment.
+
+`context_filter` remains UNVERIFIED -- no call site was found that sets it
+(the real caller always uses `..Default::default()` for it), so this
+project's implementation does not yet do anything with it.
 
 ## Q6. Does `lore-server` send an authorization header on `RebacApi` calls?
 
@@ -88,6 +118,16 @@ server-to-sidecar hop is authenticated: an empty `authorization` value
 must be treated as **absent, not malformed**, and the design plan
 recommends gating this hop with mTLS or a shared secret rather than
 expecting a user token.
+
+**Implementation status (PHASE 1a):** this question is NOT resolved, only
+worked around. `RebacApiService::create_resource` / `delete_resource`
+(`crates/lore-authz-server/src/grpc.rs`) perform no caller-identity check
+at all -- they trust the network layer entirely, matching the design
+plan's own recommendation that this hop be gated by mTLS or a shared
+secret rather than a user token, since there is still no evidence
+`lore-server` ever sends one worth decoding. Revisit before any real
+deployment: today, anything that can reach the gRPC port can create or
+delete resource rows.
 
 ## Q7. Expected `permission` string vocabulary
 

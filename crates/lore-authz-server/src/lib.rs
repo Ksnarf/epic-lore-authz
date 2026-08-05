@@ -4,7 +4,9 @@
 //! docs/protocol-notes.md and tasks.md Phase 0) exercise the signing and
 //! minting code directly without spinning up gRPC/HTTP listeners.
 
+pub mod caller;
 pub mod config;
+pub mod db;
 pub mod grpc;
 pub mod http;
 pub mod minting;

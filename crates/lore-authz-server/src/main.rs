@@ -16,6 +16,7 @@ use anyhow::Context;
 use lore_authz_proto::RebacApiServer;
 use lore_authz_proto::UrcAuthApiServer;
 use lore_authz_server::config::Config;
+use lore_authz_server::db::Db;
 use lore_authz_server::grpc::AuthApiService;
 use lore_authz_server::grpc::RebacApiService;
 use lore_authz_server::http;
@@ -26,6 +27,7 @@ use tower_http::trace::DefaultOnRequest;
 use tower_http::trace::TraceLayer;
 use tracing::Level;
 use tracing::info;
+use tracing::warn;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -35,8 +37,9 @@ async fn main() -> anyhow::Result<()> {
 
     let config = Config::from_env().context("loading configuration from environment")?;
 
-    let signing_keys =
-        SigningKeyStore::load(&config.signing_key_source).context("loading SIGNING_KEY_SOURCE")?;
+    let signing_keys = Arc::new(
+        SigningKeyStore::load(&config.signing_key_source).context("loading SIGNING_KEY_SOURCE")?,
+    );
     info!(
         kid = %signing_keys.active().kid,
         alg = "ES256",
@@ -44,10 +47,36 @@ async fn main() -> anyhow::Result<()> {
          configured key or a generated ephemeral dev key)"
     );
 
+    // PHASE 1a (see tasks.md): LookupUserPermissions, CheckUserPermission,
+    // and RebacApi::CreateResource/DeleteResource are Postgres-backed. If
+    // DATABASE_URL is not configured, those four RPCs fail closed with
+    // Status::failed_precondition (see AuthApiService::require_db /
+    // RebacApiService::require_db in grpc.rs) rather than the process
+    // refusing to start -- HealthCheck, JWKS, and the still-stubbed Phase 1b
+    // RPCs have no Postgres dependency at all. A DATABASE_URL that IS set
+    // but unreachable, or a DB_SCHEMA that fails validation, is a startup
+    // failure (bail), not a silent degrade: a misconfigured value an
+    // operator believes is live must not fail quietly.
+    let db = if config.database_url.is_empty() {
+        warn!(
+            "DATABASE_URL is not set: LookupUserPermissions, CheckUserPermission, and RebacApi \
+             will fail closed with FailedPrecondition until it is configured -- see \
+             docs/configuration.md"
+        );
+        None
+    } else {
+        let db = Db::connect(&config.database_url, &config.db_schema)
+            .await
+            .context("connecting to Postgres / applying migrations (DATABASE_URL, DB_SCHEMA)")?;
+        info!(schema = %db.schema(), "connected to Postgres and applied migrations");
+        Some(Arc::new(db))
+    };
+
     info!(
         grpc = %config.grpc_listen_addr,
         http = %config.http_listen_addr,
-        "epic-lore-authz starting (scaffold: most RPCs are not yet implemented, see tasks.md)"
+        "epic-lore-authz starting (Phase 1a: LookupUserPermissions/CheckUserPermission/RebacApi \
+         are real; see tasks.md for what remains stubbed)"
     );
 
     // Log every inbound gRPC call (method path on the span's `uri` field) at
@@ -61,13 +90,16 @@ async fn main() -> anyhow::Result<()> {
                 .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
                 .on_request(DefaultOnRequest::new().level(Level::INFO)),
         )
-        .add_service(UrcAuthApiServer::new(AuthApiService))
-        .add_service(RebacApiServer::new(RebacApiService))
+        .add_service(UrcAuthApiServer::new(AuthApiService {
+            db: db.clone(),
+            signing_keys: signing_keys.clone(),
+            jwt_issuer: config.jwt_issuer.clone(),
+            jwt_audience: config.jwt_audience.clone(),
+        }))
+        .add_service(RebacApiServer::new(RebacApiService { db: db.clone() }))
         .serve(config.grpc_listen_addr);
 
-    let app_state = AppState {
-        signing_keys: Arc::new(signing_keys),
-    };
+    let app_state = AppState { signing_keys };
     let http_server = async {
         let listener = tokio::net::TcpListener::bind(config.http_listen_addr).await?;
         axum::serve(listener, http::router(app_state)).await

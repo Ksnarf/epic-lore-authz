@@ -6,19 +6,23 @@
 use std::env;
 use std::net::SocketAddr;
 
-// Most fields are not read yet: main.rs wires grpc_listen_addr,
-// http_listen_addr, and (as of this pass) signing_key_source. jwt_issuer /
-// jwt_audience / token_env are consumed by crates/lore-authz-server/src/
-// minting.rs's functions but not yet threaded into main.rs, since the gRPC
-// handlers that would call them (ExchangeUserTokenForMultiresourceToken and
-// friends) are still Status::unimplemented stubs -- see tasks.md. The rest
-// become load-bearing as Phase 1 tasks land (IdP, persistence). Not dead
-// code in the design; just not consumed yet.
+// As of PHASE 1a (see tasks.md), main.rs wires grpc_listen_addr,
+// http_listen_addr, signing_key_source, database_url, db_schema, jwt_issuer,
+// and jwt_audience. token_env and the TTLs are consumed by
+// crates/lore-authz-server/src/minting.rs's functions but not yet threaded
+// into main.rs, since the gRPC handlers that would call them
+// (ExchangeUserTokenForMultiresourceToken and friends) are still
+// Status::unimplemented stubs -- see tasks.md Phase 1b. oidc_*/saml_* become
+// load-bearing when Phase 1b/2 land. Not dead code in the design; just not
+// all consumed yet.
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// Postgres connection string. Phase 0 runs entirely in memory and does
-    /// not read this; it becomes load-bearing in Phase 1.
+    /// Postgres connection string. PHASE 1a (see tasks.md): required for
+    /// `LookupUserPermissions`, `CheckUserPermission`, and
+    /// `RebacApi::CreateResource`/`DeleteResource` to do anything but fail
+    /// closed with `Status::failed_precondition` -- see `main.rs` and
+    /// `crates/lore-authz-server/src/db/mod.rs`.
     pub database_url: String,
     /// This product owns exactly one schema inside whatever database it is
     /// pointed at (never `public`, never CREATE DATABASE, never superuser).

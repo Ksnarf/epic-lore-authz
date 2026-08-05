@@ -20,6 +20,28 @@ jobs:
 
   build-and-test:
     runs-on: ubuntu-latest
+    # PHASE 1a (see tasks.md): crates/lore-authz-server/tests/postgres_backed.rs
+    # needs a real Postgres, not a mock -- a GitHub Actions service container
+    # is the CI equivalent of docker-compose.test.yml's `postgres` service
+    # (same image, same throwaway-only guarantee: nothing persists past this
+    # job). TEST_DATABASE_URL below points at it on localhost, since service
+    # containers on ubuntu-latest runners are reachable directly, unlike the
+    # compose network docker-compose.test.yml uses for a local run.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: test-only-not-a-real-secret
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+    env:
+      TEST_DATABASE_URL: postgres://postgres:test-only-not-a-real-secret@localhost:5432/postgres
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.97.1

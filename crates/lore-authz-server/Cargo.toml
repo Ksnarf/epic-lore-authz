@@ -44,6 +44,14 @@ ring = { workspace = true }
 base64 = { workspace = true }
 uuid = { workspace = true }
 
+# Postgres persistence for PHASE 1a (see tasks.md): principals, groups,
+# resources, and role_bindings backing LookupUserPermissions /
+# CheckUserPermission / RebacApi::CreateResource / DeleteResource. Only
+# runtime-checked queries (sqlx::query / query_as) are used, never the
+# `query!`/`query_as!` compile-time-checked macros, so `cargo build` never
+# needs a reachable Postgres (see crates/lore-authz-server/src/db/mod.rs).
+sqlx = { workspace = true }
+
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }

@@ -1,0 +1,52 @@
+# Throwaway test stack for epic-lore-authz's Postgres-backed test suite
+# (crates/lore-authz-server/tests/postgres_backed.rs).
+#
+# This is NOT a deployment artifact and must never be pointed at a shared or
+# long-lived database: `postgres` here uses a tmpfs data directory, so all
+# data is gone the moment the container is removed. `tests` never creates a
+# database, only its own throwaway schema(s) inside the one Postgres
+# database it is given (see crates/lore-authz-server/src/db/mod.rs) -- so
+# reusing this same file against a real database would still be safe, but
+# there is no reason to: this compose file's whole point is a real Postgres
+# nobody has to provision or clean up by hand.
+#
+# Usage (PowerShell or any shell with Docker Compose v2):
+#   docker compose -f docker-compose.test.yml run --rm --build tests
+#   docker compose -f docker-compose.test.yml down -v
+#
+# The image built for `tests` is the same docker/Dockerfile.build used for
+# `cargo build`/`fmt`/`clippy` (see scripts/build.ps1 / build.sh) -- nothing
+# test-specific about the toolchain image itself, only the compose wiring
+# that gives it a real Postgres to talk to.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: test-only-not-a-real-secret
+      POSTGRES_DB: postgres
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  tests:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.build
+    depends_on:
+      postgres:
+        condition: service_healthy
+    working_dir: /work
+    volumes:
+      - .:/work
+    environment:
+      # Points at the `postgres` service by its compose DNS name -- both
+      # services share this compose file's default network. Never a
+      # database this product owns or migrates in place of its own test
+      # schema; see the module doc comment on this point.
+      TEST_DATABASE_URL: postgres://postgres:test-only-not-a-real-secret@postgres:5432/postgres
+    command: ["cargo", "test", "--workspace"]

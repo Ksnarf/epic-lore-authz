@@ -36,10 +36,12 @@ several gotchas that fail silently rather than loudly.
   authorization check only checks repository membership, never a
   permission string (see `docs/protocol-notes.md`). This project does not
   promise enforcement `lore-server` itself does not perform.
-- Not (yet) a finished product. See `tasks.md` -- this repository is
-  currently a **scaffold**: structure, contracts, config surface, CI, and
-  stubbed handlers. Every RPC and HTTP handler beyond health/readiness
-  currently returns "not implemented."
+- Not (yet) a finished product. See `tasks.md`. As of PHASE 1a,
+  `LookupUserPermissions`, `CheckUserPermission`, and
+  `RebacApi::CreateResource`/`DeleteResource` are real, Postgres-backed
+  logic (see `docs/data-model.md`); the auth-session login flow
+  (`StartAuthSession`/`GetAuthSession`/`ExchangeUserTokenForMultiresourceToken`),
+  OIDC, and SAML are still `Status::unimplemented` stubs (Phase 1b/2).
 
 ## License and attribution
 
@@ -76,6 +78,24 @@ Then point an unmodified `lore-server` at it:
   (see `docs/open-questions.md` Q2 -- the exact config key is unconfirmed)
 - `auth.jwt_issuer` / `auth.jwt_audience` -> matching `JWT_ISSUER` /
   `JWT_AUDIENCE` in this project's config (see `docs/configuration.md`)
+
+## Testing
+
+`crates/lore-authz-server/tests/postgres_backed.rs` runs against a REAL
+Postgres container, not a mock -- see `docs/data-model.md` for what it
+proves. To run it with nothing but Docker:
+
+```sh
+docker compose -f docker-compose.test.yml run --rm --build tests
+docker compose -f docker-compose.test.yml down -v   # tear down the throwaway Postgres
+```
+
+This also runs every other test in the workspace (`cargo test --workspace`
+is the compose service's command). `docker-compose.test.yml` never touches
+a shared or long-lived database: `postgres` there uses a `tmpfs` data
+directory, and the tests each create their own randomly-named schema, never
+a database. `.github/workflows/ci.yml` runs the same suite against a
+GitHub Actions Postgres service container on every push/PR.
 
 ## Repository layout
 

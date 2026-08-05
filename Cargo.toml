@@ -54,7 +54,7 @@ tower-http = { version = "0.6.11", features = ["trace"] }
 tokio = { version = "1.47.1", features = ["rt-multi-thread", "macros", "signal", "net", "fs", "sync", "time"] }
 tokio-stream = "0.1.17"
 
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "rustls", "postgres", "uuid", "chrono", "migrate", "json"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "chrono", "migrate", "json", "derive", "macros"] }
 
 thiserror = "2.0.16"
 anyhow = "1.0.103"
