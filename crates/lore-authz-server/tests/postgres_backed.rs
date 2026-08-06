@@ -205,3 +205,9 @@ async fn exchange_for_a_caller_with_no_grants_yields_an_empty_resources_claim() 
 async fn exchange_denies_every_unauthenticated_caller() {
     authz_suite::exchange_denies_every_unauthenticated_caller(Backend::Postgres).await
 }
+
+#[tokio::test]
+async fn start_auth_session_without_a_provider_denies_against_real_db() {
+    authz_suite::start_auth_session_without_a_provider_denies_against_real_db(Backend::Postgres)
+        .await
+}

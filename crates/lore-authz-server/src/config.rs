@@ -89,12 +89,27 @@ pub struct Config {
 
     /// OIDC provider settings for the default/first-configured IdP
     /// connection. Real deployments configure IdP connections in the
-    /// database (Phase 1); these env vars exist for a minimal single-tenant
-    /// bring-up and local dev.
+    /// database (Phase 2+); these env vars exist for a minimal
+    /// single-tenant bring-up and local dev.
+    ///
+    /// ALL FOUR are required together: a partially configured provider is
+    /// treated as unconfigured and every browser login denies (see
+    /// `crate::oidc::OidcProvider::new` and `main.rs`). `oidc_client_secret`
+    /// comes from configuration only -- there is no default, and none is
+    /// committed anywhere in this repository.
     pub oidc_issuer_url: Option<String>,
     pub oidc_client_id: Option<String>,
     pub oidc_client_secret: Option<String>,
     pub oidc_redirect_url: Option<String>,
+    /// Space-separated OIDC scopes. `openid` is added if absent (it is
+    /// mandatory in an OIDC authorization request).
+    pub oidc_scopes: String,
+    /// Create a principal on first login for an identity that has none.
+    /// Safe as a default because it creates an IDENTITY, never an
+    /// AUTHORIZATION: a just-provisioned principal holds no role bindings,
+    /// so its AuthZ token grants nothing. Set `false` for a closed
+    /// deployment where every principal is pre-provisioned.
+    pub oidc_jit_provisioning: bool,
 
     /// SAML SP settings, same single-tenant bring-up caveat as OIDC above.
     /// Behind the `saml` cargo feature in Phase 2; see design plan section D.
@@ -123,6 +138,34 @@ fn env_var_opt(key: &str) -> Option<String> {
     env::var(key).ok().filter(|v| !v.is_empty())
 }
 
+/// Booleans are spelled the way an operator would reasonably spell them, and
+/// anything else is a hard startup failure rather than a silent default --
+/// `OIDC_JIT_PROVISIONING=flase` must not quietly mean `true`.
+fn parse_bool_env(key: &str, default: bool) -> Result<bool, anyhow::Error> {
+    match env_var_opt(key) {
+        None => Ok(default),
+        Some(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Ok(true),
+            "0" | "false" | "no" | "off" => Ok(false),
+            other => {
+                anyhow::bail!("{key} must be one of true/false/1/0/yes/no/on/off, got {other:?}")
+            }
+        },
+    }
+}
+
+/// Scheme + host + optional port of a URL, with no trailing slash -- e.g.
+/// `https://authz.example.com:8443/oidc/callback` -> `https://authz.example.com:8443`.
+/// Returns `None` for anything that is not a parseable absolute URL.
+fn origin_of(url: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let host = parsed.host_str()?;
+    Some(match parsed.port() {
+        Some(port) => format!("{}://{host}:{port}", parsed.scheme()),
+        None => format!("{}://{host}", parsed.scheme()),
+    })
+}
+
 impl Config {
     pub fn from_env() -> Result<Self, anyhow::Error> {
         let jwt_audience = env_var("JWT_AUDIENCE")?
@@ -147,6 +190,21 @@ impl Config {
             );
         }
 
+        // PUBLIC_BASE_URL falls back to the ORIGIN of OIDC_REDIRECT_URL,
+        // because in every realistic deployment they are the same host: the
+        // redirect URL IS a path on this service's public origin. Deriving
+        // it removes a required setting whose only correct value is already
+        // written down elsewhere, and a wrong value here produces a login
+        // URL that goes nowhere.
+        let oidc_redirect_url = env_var_opt("OIDC_REDIRECT_URL");
+        let public_base_url = match env_var_opt("PUBLIC_BASE_URL") {
+            Some(explicit) => explicit.trim_end_matches('/').to_string(),
+            None => oidc_redirect_url
+                .as_deref()
+                .and_then(origin_of)
+                .unwrap_or_default(),
+        };
+
         Ok(Config {
             database_url: env_var_or("DATABASE_URL", ""),
             db_schema: env_var_or("DB_SCHEMA", "loreauth"),
@@ -157,9 +215,7 @@ impl Config {
             authz_token_ttl_secs: env_var_or("AUTHZ_TOKEN_TTL_SECS", "3600").parse()?,  // 1h
             token_idp,
             auth_session_ttl_secs: env_var_or("AUTH_SESSION_TTL_SECS", "300").parse()?, // 5m
-            public_base_url: env_var_or("PUBLIC_BASE_URL", "")
-                .trim_end_matches('/')
-                .to_string(),
+            public_base_url,
             signing_key_source: env_var_or(
                 "SIGNING_KEY_SOURCE",
                 "file:///CHANGE_ME/signing-key.der",
@@ -170,10 +226,71 @@ impl Config {
             oidc_issuer_url: env_var_opt("OIDC_ISSUER_URL"),
             oidc_client_id: env_var_opt("OIDC_CLIENT_ID"),
             oidc_client_secret: env_var_opt("OIDC_CLIENT_SECRET"),
-            oidc_redirect_url: env_var_opt("OIDC_REDIRECT_URL"),
+            oidc_redirect_url,
+            oidc_scopes: env_var_or("OIDC_SCOPES", "openid profile email"),
+            oidc_jit_provisioning: parse_bool_env("OIDC_JIT_PROVISIONING", true)?,
             saml_sp_entity_id: env_var_opt("SAML_SP_ENTITY_ID"),
             saml_idp_metadata_url: env_var_opt("SAML_IDP_METADATA_URL"),
             rebac_service_token: env_var_opt("REBAC_SERVICE_TOKEN"),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn origin_is_derived_without_the_path_and_keeps_a_non_default_port() {
+        assert_eq!(
+            origin_of("https://authz.example.com/oidc/callback").as_deref(),
+            Some("https://authz.example.com")
+        );
+        assert_eq!(
+            origin_of("https://authz.example.com:8443/oidc/callback").as_deref(),
+            Some("https://authz.example.com:8443")
+        );
+        assert_eq!(
+            origin_of("http://127.0.0.1:18080/oidc/callback").as_deref(),
+            Some("http://127.0.0.1:18080")
+        );
+        // Not a usable origin -- the caller falls back to "unconfigured",
+        // which denies, rather than to a half-formed URL.
+        assert_eq!(origin_of("not a url"), None);
+        assert_eq!(origin_of("/oidc/callback"), None);
+    }
+
+    /// A typo in a boolean must fail loudly. `OIDC_JIT_PROVISIONING=flase`
+    /// silently meaning `true` is exactly the kind of misconfiguration this
+    /// setting exists to prevent.
+    #[test]
+    fn a_misspelled_boolean_is_a_startup_failure_not_a_silent_default() {
+        // SAFETY: `set_var`/`remove_var` are unsafe in edition 2024 because
+        // they race with other threads reading the environment. This test
+        // uses a key no other test touches, and asserts on the parse result
+        // rather than on any global config state.
+        const KEY: &str = "LORE_AUTHZ_TEST_BOOL_PARSE";
+        unsafe { env::remove_var(KEY) };
+        assert!(parse_bool_env(KEY, true).unwrap());
+        assert!(!parse_bool_env(KEY, false).unwrap());
+
+        for (value, expected) in [
+            ("true", true),
+            ("TRUE", true),
+            ("1", true),
+            ("yes", true),
+            ("on", true),
+            ("false", false),
+            ("0", false),
+            ("no", false),
+            ("off", false),
+        ] {
+            unsafe { env::set_var(KEY, value) };
+            assert_eq!(parse_bool_env(KEY, !expected).unwrap(), expected);
+        }
+
+        unsafe { env::set_var(KEY, "flase") };
+        assert!(parse_bool_env(KEY, true).is_err());
+        unsafe { env::remove_var(KEY) };
     }
 }

@@ -21,6 +21,9 @@ use lore_authz_server::grpc::AuthApiService;
 use lore_authz_server::grpc::RebacApiService;
 use lore_authz_server::http;
 use lore_authz_server::http::AppState;
+use lore_authz_server::oidc::OidcConfig;
+use lore_authz_server::oidc::OidcProvider;
+use lore_authz_server::oidc_login::OidcLoginSettings;
 use lore_authz_server::signing::SigningKeyStore;
 use tower_http::trace::DefaultMakeSpan;
 use tower_http::trace::DefaultOnRequest;
@@ -114,10 +117,59 @@ async fn main() -> anyhow::Result<()> {
     };
     if login_settings.public_base_url.is_empty() {
         warn!(
-            "PUBLIC_BASE_URL is not set: StartAuthSession will deny with FailedPrecondition \
-             because it cannot build a browser login URL -- see docs/configuration.md"
+            "PUBLIC_BASE_URL is not set (and no origin could be derived from OIDC_REDIRECT_URL): \
+             StartAuthSession will deny with FailedPrecondition because it cannot build a browser \
+             login URL -- see docs/configuration.md"
         );
     }
+
+    // PHASE 1b: the identity provider. ALL FOUR settings are required
+    // together -- a partially configured provider is treated as
+    // unconfigured, and an unconfigured provider makes StartAuthSession and
+    // both browser login routes DENY. There is deliberately no degraded mode
+    // in which a login half-works.
+    //
+    // A provider that IS configured but unreachable is NOT a startup
+    // failure: discovery is lazy and cached, so an IdP that is briefly down
+    // (or that comes up after this process) costs a failed login, not a
+    // crash loop. That is the opposite trade-off from DATABASE_URL above,
+    // and deliberately so: this service is the thing lore-server itself
+    // blocks on at ITS boot (see docs/protocol-notes.md section 4).
+    let oidc = match (
+        config.oidc_issuer_url.as_deref(),
+        config.oidc_client_id.as_deref(),
+        config.oidc_client_secret.as_deref(),
+        config.oidc_redirect_url.as_deref(),
+    ) {
+        (Some(issuer), Some(client_id), Some(client_secret), Some(redirect_url)) => {
+            let provider = OidcProvider::new(OidcConfig {
+                issuer: issuer.to_string(),
+                client_id: client_id.to_string(),
+                client_secret: client_secret.to_string(),
+                redirect_url: redirect_url.to_string(),
+                scopes: config.oidc_scopes.clone(),
+            })
+            .context("building the OIDC provider (OIDC_* settings)")?;
+            info!(
+                issuer,
+                jit_provisioning = config.oidc_jit_provisioning,
+                "OIDC identity provider configured (discovery happens lazily on first login)"
+            );
+            Some(Arc::new(provider))
+        }
+        _ => {
+            warn!(
+                "OIDC is not fully configured (OIDC_ISSUER_URL, OIDC_CLIENT_ID, \
+                 OIDC_CLIENT_SECRET and OIDC_REDIRECT_URL are all required together): \
+                 StartAuthSession and the browser login routes will DENY every request until \
+                 they are -- see docs/configuration.md"
+            );
+            None
+        }
+    };
+    let oidc_login_settings = OidcLoginSettings {
+        jit_provisioning: config.oidc_jit_provisioning,
+    };
 
     info!(
         grpc = %config.grpc_listen_addr,
@@ -143,6 +195,7 @@ async fn main() -> anyhow::Result<()> {
             jwt_issuer: config.jwt_issuer.clone(),
             jwt_audience: config.jwt_audience.clone(),
             login: login_settings.clone(),
+            oidc: oidc.clone(),
         }))
         .add_service(RebacApiServer::new(RebacApiService {
             db: db.clone(),
@@ -150,7 +203,12 @@ async fn main() -> anyhow::Result<()> {
         }))
         .serve(config.grpc_listen_addr);
 
-    let app_state = AppState { signing_keys };
+    let app_state = AppState {
+        signing_keys,
+        db: db.clone(),
+        oidc,
+        oidc_login: oidc_login_settings,
+    };
     let http_server = async {
         let listener = tokio::net::TcpListener::bind(config.http_listen_addr).await?;
         axum::serve(listener, http::router(app_state)).await

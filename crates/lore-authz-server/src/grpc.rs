@@ -29,6 +29,8 @@ use crate::login::LoginSettings;
 use crate::login::PollOutcome;
 use crate::minting::AuthzTokenInput;
 use crate::minting::mint_authz_token;
+use crate::oidc::OidcProvider;
+use crate::oidc_login;
 use crate::service_auth;
 use crate::signing::SigningKeyStore;
 
@@ -67,6 +69,12 @@ pub struct AuthApiService {
     /// Token/session knobs for the PHASE 1b login and exchange RPCs -- see
     /// `crate::login::LoginSettings`.
     pub login: LoginSettings,
+    /// `None` when no identity provider is configured (or only partly --
+    /// see `crate::oidc::OidcProvider::new`). `StartAuthSession` then denies
+    /// rather than issuing a login that could never complete. The other RPCs
+    /// do not use it: once a session is authenticated, the identity provider
+    /// is out of the picture.
+    pub oidc: Option<Arc<OidcProvider>>,
 }
 
 impl AuthApiService {
@@ -121,14 +129,34 @@ impl epic_urc::urc_auth_api_server::UrcAuthApi for AuthApiService {
         }))
     }
 
-    // P0, Phase 1b (deliberately untouched by PHASE 1a -- see tasks.md).
+    // PHASE 1b (see tasks.md). Creates a pending login session and hands
+    // the CLI back a polling secret plus a browser URL.
+    //
+    // FAILS CLOSED when there is no identity provider configured: without
+    // one there is nothing that could ever authenticate the session, so
+    // issuing a session_code and a login URL would only produce a login that
+    // times out after 150 seconds of polling with no explanation. An
+    // unconfigured provider denies here, loudly, with the reason.
     async fn start_auth_session(
         &self,
-        _request: Request<epic_urc::StartAuthSessionRequest>,
+        request: Request<epic_urc::StartAuthSessionRequest>,
     ) -> Result<Response<epic_urc::StartAuthSessionResponse>, Status> {
-        Err(Status::unimplemented(
-            "start_auth_session: Phase 1b (see tasks.md)",
-        ))
+        let db = self.require_db()?.clone();
+        if self.oidc.is_none() {
+            return Err(Status::failed_precondition(
+                "no identity provider is configured (OIDC_ISSUER_URL / OIDC_CLIENT_ID / \
+                 OIDC_CLIENT_SECRET / OIDC_REDIRECT_URL) -- browser login is unavailable; see \
+                 docs/configuration.md",
+            ));
+        }
+        let req = request.into_inner();
+
+        let started = oidc_login::start(&db, &self.login, &req.client_state).await?;
+
+        Ok(Response::new(epic_urc::StartAuthSessionResponse {
+            session_code: started.session_code,
+            login_url: started.login_url,
+        }))
     }
 
     // PHASE 1b (see tasks.md). The CLI polls this every 5 seconds while the
@@ -641,7 +669,24 @@ mod tests {
             jwt_issuer: "https://authz.example.com".to_string(),
             jwt_audience: vec!["lore.example.com".to_string()],
             login: LoginSettings::default(),
+            oidc: None,
         }
+    }
+
+    /// PHASE 1b. An unconfigured identity provider must DENY every login
+    /// attempt, never issue a session that could not possibly complete --
+    /// the same fail-closed rule the `RebacApi` gate follows.
+    #[tokio::test]
+    async fn start_auth_session_without_a_configured_provider_fails_closed() {
+        let service = service_without_db();
+        let request = Request::new(epic_urc::StartAuthSessionRequest {
+            client_state: "a-client-state".to_string(),
+        });
+
+        let err = epic_urc::urc_auth_api_server::UrcAuthApi::start_auth_session(&service, request)
+            .await
+            .expect_err("an unconfigured login flow must deny, never issue a session");
+        assert_eq!(err.code(), Code::FailedPrecondition);
     }
 
     /// Exercises the REAL production early-return path (not a mock): when

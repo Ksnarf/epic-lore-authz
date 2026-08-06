@@ -323,14 +323,199 @@ integration test has actually been run and its output logged.
       this up next should add the three variables above to `.env.example`
       from the `docs/configuration.md` table.
 
+## PHASE 1b, part 2 - OIDC login (StartAuthSession + the browser leg) (2026-08-05)
+
+- [x] `StartAuthSession` (real logic). [verified-e2e] `grpc.rs` +
+      `crates/lore-authz-server/src/oidc_login.rs`'s `start`. Mints this
+      session's OIDC `state`, `nonce` and PKCE verifier from the same CSPRNG
+      as the session codes (never derived from anything the client sent) and
+      returns `{session_code, login_url}`.
+      FAILS CLOSED with no identity provider configured: without one nothing
+      could ever authenticate the session, so issuing a code would only
+      produce a login that times out after 150 seconds with no explanation.
+      Proven by `grpc::tests::start_auth_session_without_a_configured_
+      provider_fails_closed` and, against a real database,
+      `start_auth_session_without_a_provider_denies_against_real_db` (both
+      backends).
+- [x] Generic OIDC relying party, provider-agnostic by construction.
+      [verified-e2e] `crates/lore-authz-server/src/oidc.rs`. Every endpoint,
+      the JWKS location, AND the token-endpoint client-authentication method
+      come from the provider's own `/.well-known/openid-configuration`;
+      there is no per-vendor branch anywhere in the file. Discovery and JWKS
+      are cached (1h / 5m) with a single forced JWKS refetch on a `kid` miss
+      -- one retry, not a loop, so a `kid` an attacker controls cannot be
+      turned into a request amplifier pointed at the provider.
+      The discovery document's own `issuer` must equal the configured one
+      (OIDC Discovery section 4.3); a mismatch is refused, because accepting
+      it turns a hijacked discovery URL into full provider substitution.
+- [x] Authorization-code flow with PKCE, `state` and `nonce`.
+      [verified-e2e] `state` is the session lookup key (an unrecognized
+      value matches no session, so the callback fails closed and the code is
+      never presented to the token endpoint); `nonce` is compared in
+      constant time and a token with NO nonce is rejected rather than
+      treated as "nothing to compare"; PKCE is S256 with the verifier never
+      leaving this service. `pkce_challenge_matches_the_rfc_7636_worked_
+      example` pins the challenge derivation to RFC 7636 appendix B rather
+      than to this implementation's own output.
+- [x] ID token verification: signature, `iss`, `aud`, `exp`, `nonce`.
+      [verified-e2e] Signature is checked against the key the provider
+      publishes under the token's own `kid`, with the ALGORITHM pinned to
+      what the JWKS declares and restricted to an ASYMMETRIC allowlist.
+      Accepting an `HS*` algorithm here is the classic key-confusion attack
+      (forge a token by using the provider's published PUBLIC key as an HMAC
+      secret) -- refused explicitly, with unit tests
+      (`symmetric_algorithms_are_refused_even_if_the_key_declares_one`,
+      `a_header_algorithm_that_disagrees_with_the_key_is_refused`).
+- [x] JIT user provisioning. [verified-e2e]
+      `oidc_login::resolve_principal`. Identity key is the provider's `sub`
+      (`principals.subject`, UNIQUE on `(source, subject)`), NEVER the email
+      -- an email can be reassigned to a different human. A JIT-provisioned
+      principal holds NO role bindings, so it authenticates and receives an
+      AuthZ token whose `resources` is empty: provisioning creates an
+      IDENTITY, never an AUTHORIZATION, which is what makes it safe to
+      default on (`OIDC_JIT_PROVISIONING`, default true).
+      Deliberate omissions, not oversights: a login never changes
+      `principals.status`, so a suspended or deprovisioned principal logging
+      in again is DENIED rather than silently reactivated; and group-claim
+      mapping is NOT implemented (still open under Phase 1 below) -- emitting
+      a half-mapped `groups` claim would be worse than emitting none.
+- [x] Browser routes. [verified-e2e] `http.rs`: `GET /login/{login_code}`
+      redirects to the provider, `GET /oidc/callback` completes the session,
+      `GET /login/done` is the "you may close this tab" page. Every failure
+      renders the SAME page with the same status (unknown login code,
+      expired session, replayed callback, unrecognized `state`, validation
+      failure), so neither route can be used to probe which sessions are
+      live. The one distinguished case is `ProviderUnavailable`, which is an
+      OPERATOR problem and reveals nothing about any session. Pages are
+      fully self-contained HTML with `referrer: no-referrer` and no external
+      asset of any kind.
+- [x] Real IdP in a container, wired for a stranger cloning the repo.
+      [verified-e2e] `docker/dex/config.yaml` + a `dex` service in
+      `docker-compose.test.yml`. `docker compose -f docker-compose.test.yml
+      run --rm --build tests` now brings up a real Postgres AND a real OIDC
+      provider and runs everything. Documented in `README.md`'s Testing
+      section.
+- [x] CI. [code-says] -- not run (this repo is commit-only per the task
+      constraints, never pushed). `.github/workflows/ci.yml`'s
+      `build-and-test` job starts the same Dex image with the same committed
+      config via `docker run` (a GitHub Actions `services:` container cannot
+      mount a config file) and adds `127.0.0.1 dex` to `/etc/hosts`. That
+      hosts line is load-bearing: Dex bakes its issuer into every discovery
+      document and every ID token and does NOT expand environment variables
+      in its config (verified for real against v2.44.0 -- it logged the
+      literal `${DEX_ISSUER}`), so ONE committed config has to work for both
+      compose (service-name DNS) and CI (published port on loopback).
+- [x] 16 OIDC tests against a REAL identity provider, all passing.
+      [verified-e2e] `crates/lore-authz-server/tests/oidc_flow.rs`. Storage
+      cases run against BOTH backends.
+      Maximum fidelity: `full_login_flow_end_to_end_through_the_real_http_
+      server_{postgres,sqlite}` binds this service's REAL axum router to a
+      real socket and walks the entire flow with a redirect-following HTTP
+      client exactly as a browser would -- our `/login` route, the
+      provider's authorize endpoint, the provider's redirect back to our
+      `/oidc/callback`, the success page -- then polls for the AuthN token
+      and exchanges it for an AuthZ token, asserting `idp` names the real
+      issuer, `env` is present, and `resources` is EMPTY for a
+      freshly-provisioned principal.
+      Attack paths, each driven with REAL provider responses:
+      `callback_with_an_unknown_state_is_rejected_*` (a genuine
+      authorization code obtained under a `state` this service never
+      issued -- the login-CSRF shape),
+      `callback_with_a_mismatched_nonce_is_rejected_*` (the session's own
+      `state` and PKCE verifier, so the exchange SUCCEEDS and only the
+      replay check can catch it),
+      `a_replayed_callback_cannot_complete_a_session_twice_*`,
+      `jit_disabled_denies_an_unknown_identity_*`,
+      `a_second_login_reuses_the_same_principal_*`.
+      Token-level, against a REAL provider-signed RS256 ID token:
+      `a_real_provider_signed_id_token_is_accepted` (the positive control --
+      without it a verifier that rejected everything would pass the rest),
+      `an_id_token_with_a_tampered_signature_is_rejected` (one byte of a real
+      signature flipped),
+      `an_id_token_signed_by_a_key_the_provider_does_not_publish_is_rejected`,
+      `a_real_id_token_with_the_wrong_nonce_is_rejected`.
+- [~] Test coverage gaps, stated rather than papered over:
+      - **Unconfigured-provider denial is proven at the RPC and unit level**
+        (`start_auth_session_without_a_provider_denies_against_real_db`,
+        `grpc::tests::start_auth_session_without_a_configured_provider_
+        fails_closed`, and `oidc::tests::a_partially_configured_provider_is_
+        refused_at_construction`), but NOT through the HTTP routes -- the
+        browser routes' `login_not_configured_page` path is `[code-says]`,
+        read but not executed by a test.
+      - **The issuer-mismatch refusal in discovery is `[code-says]`**: it
+        would need a second, deliberately-misconfigured provider to exercise
+        for real, and the real one always agrees with itself.
+      - The `ProviderUnavailable` pages are `[code-says]` for the same
+        reason (the test IdP is always up).
+
+**Left open / explicitly out of scope for this pass**: SAML and SCIM
+(untouched by instruction), group-claim mapping, key rotation, `audit_log`,
+`GetUserInfo`/`GetUserId`/`GetProviderUserId`,
+`ExchangeExternalTokenForUserToken`/`ExchangeAPIKeyForUserToken`, and the
+Phase 0 exit gate (a real `lore auth login` against a real `lore-server`),
+which still needs TLS on the client-facing endpoint and a running
+lore-server -- see `docs/protocol-notes.md` #9 for what remains unproven
+client-side.
+
+**PROOF for the whole of PHASE 1b (all four checks run for real in the
+pinned build image `docker/Dockerfile.build`; the Postgres- and IdP-backed
+tests via `docker compose -f docker-compose.test.yml run --rm --build
+tests`, which brings up a real `postgres:16-alpine` AND a real
+`ghcr.io/dexidp/dex:v2.44.0` and runs the FULL `cargo test --workspace`):**
+
+- `cargo build --workspace`: clean, `Finished dev profile`, exit 0.
+- `cargo fmt --all -- --check`: clean, exit 0 (one `cargo fmt --all` pass
+  applied first; whitespace/line-wrap only).
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean, exit 0.
+  One real fix along the way: `parts.iter().any(|s| *s == "openid")` in
+  `oidc.rs`'s `normalize_scopes` tripped `clippy::search_is_some`'s
+  `contains` lint; rewritten to `parts.contains(&"openid")`.
+- `cargo test --workspace`: **139 passed, 0 failed** (was 74 at the start of
+  this session's work), compose exit 0:
+  - `lore-authz-core` / `lore-authz-proto`: 0 tests (unchanged).
+  - `lore-authz-server` unit tests: **51** (was 30). New: 3 in `signing`
+    (the RFC 7638 `kid`), 3 in `secret`, 2 in `config`, 8 in `oidc`, 5 in
+    `grpc`.
+  - `tests/lore_compat.rs`: **4**, unchanged.
+  - `tests/oidc_flow.rs`: **16**, against a REAL OIDC provider container.
+  - `tests/postgres_backed.rs`: **34** (was 20), real Postgres 16.
+  - `tests/sqlite_backed.rs`: **34** (was 20) -- the EXACT SAME 34 names,
+    same shared bodies, `Backend::Sqlite`.
+
+Also verified this pass, raw commands not just claimed: `sha256sum
+proto/vendor/{auth_api,rebac_api}.proto` recomputed and compared
+byte-for-byte against `proto/vendor/SHA256SUMS` (unchanged -- no proto file
+was touched); `git -C <epic-lore fork> status --short` empty (the fork is
+untouched, read-only as required); a repo-wide non-ASCII scan of every
+tracked AND untracked-but-new file (zero hits); greps across the same file
+set for embargo-sensitive terms, the operator's real name, drive-letter /
+host-absolute filesystem paths, and real key material -- zero hits, except
+the pre-existing `-----BEGIN PRIVATE KEY-----` string literals `signing.rs`
+uses to DETECT PEM input, which are markers, not key material.
+
 ## Phase 1 - Real IdP, persistence, service accounts
 
 - [ ] Postgres, sqlx migrations, schema-qualified DDL, `DB_SCHEMA` config
       honored (never `public`, never a dedicated database, never
       superuser).
-- [ ] OIDC authorization code + PKCE against Okta, Entra ID, Auth0,
+- [~] OIDC authorization code + PKCE against Okta, Entra ID, Auth0,
       Keycloak.
-- [ ] JIT user provisioning, group claim to `groups` mapping.
+      [verified-e2e] against a real containerized OIDC provider (Dex), and
+      built provider-agnostically -- every endpoint comes from the
+      provider's own discovery document, with no per-vendor branch anywhere
+      (see PHASE 1b part 2 above). Still `[~]` and not `[x]` for an honest
+      reason: NO named vendor in this line has actually been run against.
+      There is no Okta/Entra/Auth0 tenant available to this project yet, so
+      "works against Okta" remains a claim about protocol conformance, not
+      an observation. Whoever gets a tenant should run
+      `tests/oidc_flow.rs` against it by changing `TEST_OIDC_*` -- no test
+      code should need to change, and if it does, that is the finding.
+- [~] JIT user provisioning, group claim to `groups` mapping.
+      JIT provisioning: [verified-e2e], see PHASE 1b part 2 above
+      (`OIDC_JIT_PROVISIONING`, identity keyed on the provider's `sub`,
+      provisioned principals hold no grants).
+      Group claim mapping: [not-built], deliberately. The exchange RPC emits
+      `groups: None` rather than a partially-mapped list.
 - [ ] Full RBAC: roles, role_bindings, wildcard bindings. Token minter
       reads real policy (`lore-authz-core::policy::PolicyStore`).
 - [ ] `ExchangeExternalTokenForUserToken` (api-key and CI-OIDC token

@@ -26,7 +26,9 @@ Every value in `.env.example` is a placeholder. Never commit a real `.env`
 | `REBAC_SERVICE_TOKEN` | **yes, effectively** | (none) | Shared secret gating `RebacApi::CreateResource`/`DeleteResource` (security review remediation -- see `docs/open-questions.md` Q6). Present as `authorization: Bearer <value>` on those two RPCs only; unrelated to `JWT_ISSUER`/`JWT_AUDIENCE` and not a JWT. **Unset means both RPCs deny every caller** with `Status::unauthenticated` (`crates/lore-authz-server/src/service_auth.rs`) -- a deliberate fail-closed default, not a bug. See the dedicated section below for the honest gap this does and does not close. |
 | `GRPC_LISTEN_ADDR` | no | `0.0.0.0:8443` | `UrcAuthApi` + `RebacApi`. Must be reachable over TLS trusted by the lore CLI's native roots in any real deployment. |
 | `HTTP_LISTEN_ADDR` | no | `0.0.0.0:8080` | JWKS, login, OIDC/SAML callbacks, health, metrics. |
-| `OIDC_ISSUER_URL` / `OIDC_CLIENT_ID` / `OIDC_CLIENT_SECRET` / `OIDC_REDIRECT_URL` | Phase 1 | (none) | Single-tenant local-dev bring-up. Multi-IdP deployments configure `idp_connections` in the database instead. |
+| `OIDC_ISSUER_URL` / `OIDC_CLIENT_ID` / `OIDC_CLIENT_SECRET` / `OIDC_REDIRECT_URL` | **yes for login** | (none) | The identity provider browser login runs against. **All four are required together** -- a partially configured provider is treated as UNCONFIGURED and every login denies. See the dedicated section below. Multi-IdP deployments will configure `idp_connections` in the database instead (Phase 2+); these env vars are the single-tenant bring-up. |
+| `OIDC_SCOPES` | no | `openid profile email` | Space-separated. `openid` is added automatically if you leave it out. |
+| `OIDC_JIT_PROVISIONING` | no | `true` | Create a principal on first login for an identity that has none. Safe as a default because it creates an IDENTITY, never an AUTHORIZATION: a just-provisioned principal holds no role bindings, so its AuthZ token's `resources` claim is empty and it can see nothing until an operator grants it something. Set `false` for a closed deployment where every principal is pre-provisioned. Accepts `true/false/1/0/yes/no/on/off`; anything else is a startup failure, not a silent default. |
 | `SAML_SP_ENTITY_ID` / `SAML_IDP_METADATA_URL` | Phase 2 | (none) | Behind the `saml` cargo feature. |
 | `RUST_LOG` | no | `info` | Standard `tracing_subscriber::EnvFilter` syntax. |
 
@@ -83,6 +85,61 @@ setting it in any real deployment: the lore CLI validates `aud` against the
 lore SERVER's own domain **client-side**, independently of whatever
 `lore-server`'s own `auth.jwt_audience` config accepts. The simplest correct
 configuration sets both to the lore server's root domain.
+
+## Setting up the identity provider (OIDC)
+
+Browser login runs an OpenID Connect authorization-code flow with PKCE
+against whatever provider you configure. There is no per-vendor code in this
+project: every endpoint is read from the provider's own
+`/.well-known/openid-configuration`, so any IdP implementing OIDC Discovery
+and the authorization-code grant works.
+
+Register an application with your provider and set:
+
+| Setting | Value |
+|---|---|
+| `OIDC_ISSUER_URL` | The provider's issuer identifier, e.g. `https://idp.example.com`. Must match the `issuer` in its own discovery document exactly -- a mismatch is refused (OIDC Discovery section 4.3), because accepting one would let a hijacked discovery URL substitute a different provider entirely. |
+| `OIDC_CLIENT_ID` | The client id the provider issued. |
+| `OIDC_CLIENT_SECRET` | The client secret the provider issued. Comes from configuration ONLY. There is no default and none is committed anywhere in this repository. |
+| `OIDC_REDIRECT_URL` | `<PUBLIC_BASE_URL>/oidc/callback`, registered verbatim with the provider. |
+
+**All four are required together.** A partially configured provider is
+treated as unconfigured: `StartAuthSession` denies with
+`FailedPrecondition`, and both browser login routes deny. There is no
+degraded mode in which a login half-works.
+
+A provider that is configured but temporarily unreachable is NOT a startup
+failure -- discovery is lazy and cached, so an IdP that is briefly down (or
+that comes up after this process) costs a failed login, not a crash loop.
+That is the opposite trade-off from `DATABASE_URL`, and deliberately so:
+`lore-server` blocks on THIS service at its own boot (see
+`docs/protocol-notes.md` section 4), so this service refusing to start
+because someone else's service is down would take the whole deployment with
+it.
+
+What is validated on every login, and what each check is for:
+
+- **`state`**: the only thing tying the provider's redirect back to the
+  session that started it. An unrecognized value matches no session and the
+  callback fails closed. Without it, an attacker could deliver their own
+  authorization code to a victim's callback.
+- **`nonce`**: compared in constant time against the value bound to the
+  session. Without it, an ID token obtained elsewhere for the same client
+  could be replayed.
+- **PKCE (S256)**: the code verifier never leaves this service, so an
+  intercepted authorization code is useless.
+- **Signature**: verified against the key the provider publishes under the
+  ID token's own `kid`, with the algorithm pinned to what the JWKS declares
+  and restricted to asymmetric algorithms. Accepting an `HS*` algorithm here
+  is the classic key-confusion attack, where a forged token is signed using
+  the provider's own PUBLIC key as an HMAC secret.
+- **`iss` / `aud` / `exp`**: exact issuer, our client id in the audience,
+  and expiry.
+
+Users are identified by the provider's `sub` claim, never by email address
+(an email can be reassigned to a different person; a `sub` cannot). The
+issuer is recorded as the principal's `idp` and becomes the `idp` claim on
+that user's AuthZ tokens.
 
 ## The 150-second client login deadline (a client-side limit, documented not worked around)
 

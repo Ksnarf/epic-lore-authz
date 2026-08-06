@@ -40,9 +40,19 @@ tokio = { workspace = true }
 jsonwebtoken = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# serde_with: the OIDC ID token's `aud` claim is a single string OR an array
+# on the wire, exactly like lore's own tokens -- the same
+# `OneOrMany<_, PreferMany>` handling lore-authz-core uses. Promoted from a
+# dev-dependency (where it only compiled the vendored compat-test structs)
+# to a real one in PHASE 1b for crates/lore-authz-server/src/oidc.rs.
+serde_with = { workspace = true }
 ring = { workspace = true }
 base64 = { workspace = true }
 uuid = { workspace = true }
+
+# PHASE 1b: the OIDC client leg. See the workspace Cargo.toml for why
+# native roots rather than webpki roots.
+reqwest = { workspace = true }
 
 # Postgres persistence for PHASE 1a (see tasks.md): principals, groups,
 # resources, and role_bindings backing LookupUserPermissions /
@@ -59,7 +69,8 @@ tracing-subscriber = { workspace = true }
 async-trait = { workspace = true }
 
 [dev-dependencies]
-# Only needed to compile the vendored copy of lore-server's AuthorizationToken
-# / JWTUserInfo structs (identical `#[serde_as] OneOrMany<_, PreferMany>` `aud`
-# handling as upstream) in tests/lore_compat.rs.
-serde_with = { workspace = true }
+# tests/oidc_flow.rs drives a REAL browser leg against a real IdP container:
+# it needs a cookie jar (the IdP sets one between /auth and its callback)
+# and control over redirect following, neither of which the non-test client
+# in src/oidc.rs uses.
+reqwest = { workspace = true, features = ["cookies"] }

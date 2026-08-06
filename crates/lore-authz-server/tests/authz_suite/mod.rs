@@ -284,6 +284,11 @@ impl Harness {
             jwt_issuer: ISSUER.to_string(),
             jwt_audience: audience(),
             login: login_settings(),
+            // These cases exercise everything either side of the identity
+            // provider; the provider leg itself has its own suite against a
+            // REAL IdP container (tests/oidc_flow.rs). `None` here also
+            // means `StartAuthSession` denies, which is asserted directly.
+            oidc: None,
         };
         let rebac_service = RebacApiService {
             db: Some(db.clone()),
@@ -1358,6 +1363,21 @@ pub async fn starting_a_session_without_a_public_base_url_fails_closed(backend: 
     .await
     .expect_err("an empty client_state must be refused");
     assert_eq!(err.code(), Code::InvalidArgument);
+}
+
+/// An unconfigured identity provider must DENY every login attempt through
+/// the real RPC, never issue a session_code for a login that could not
+/// possibly complete.
+pub async fn start_auth_session_without_a_provider_denies_against_real_db(backend: Backend) {
+    let h = Harness::new(backend).await; // built with oidc: None
+    let err = h
+        .auth_service
+        .start_auth_session(Request::new(epic_urc::StartAuthSessionRequest {
+            client_state: "a-client-state".to_string(),
+        }))
+        .await
+        .expect_err("an unconfigured identity provider must deny");
+    assert_eq!(err.code(), Code::FailedPrecondition);
 }
 
 /// The opportunistic reaper actually removes expired rows, so the session

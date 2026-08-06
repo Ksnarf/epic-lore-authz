@@ -196,22 +196,37 @@ side without a change to that other repository. A shared secret is the
 mechanism that can actually be enforced entirely on this project's own
 side of the hop today.
 
-## Q13. Where does `ExchangeUserTokenForMultiresourceToken` get `idp` from?
+## Q13. Where does `ExchangeUserTokenForMultiresourceToken` get `idp` from? (SETTLED)
 
-Not a wire-format question -- a design question for whoever wires that RPC
-(still `Status::unimplemented`, tasks.md). `AuthzClaims`/lore-server's
-`AuthorizationToken` require `idp` (docs/protocol-notes.md #2), but
-`AuthnClaims`/lore-server's `JWTUserInfo` (the AuthN token the RPC receives
-as its bearer token) has no `idp` field to decode it back out of. Proposed:
-look `idp` up from the `Principal` row `sub` identifies, via
-`Principal.idp_connection_id` (`crates/lore-authz-core/src/model.rs`) --
-requires Phase 1 persistence to exist first, so tracked here rather than
-solved in this Phase 0 pass. See docs/protocol-notes.md #7b and
-`crates/lore-authz-server/src/minting.rs`.
+Not a wire-format question -- a design question for whoever wired that RPC.
+`AuthzClaims`/lore-server's `AuthorizationToken` require `idp`
+(docs/protocol-notes.md #2), but `AuthnClaims`/lore-server's `JWTUserInfo`
+(the AuthN token the RPC receives as its bearer token) has no `idp` field to
+decode it back out of.
 
-Whatever design answers this question must make it structurally impossible
-to mint an AuthZ token without `idp` -- which is why `AuthzTokenInput::idp`
-is a mandatory `String` today, not an `Option`.
+**SETTLED (PHASE 1b): from the principal row, via a new `principals.idp`
+column** (`migrations/0002_auth_sessions.sql`,
+`lore_authz_core::model::Principal::idp`). The OIDC login leg records which
+identity provider proved a principal's identity -- the issuer URL, which is
+stable, meaningful to an operator reading a raw token, and needs no separate
+configuration to stay in sync with the provider it names. The exchange RPC
+reads it back off that row.
+
+The `idp_connection_id` route originally proposed here was not taken: it
+would only add a join to reach a value the login leg already knows, and a
+`Principal` can be provisioned without any IdP connection row at all (the
+Phase 1a manual/test path).
+
+Two guarantees make "an AuthZ token with no `idp`" unrepresentable rather
+than merely unlikely:
+
+- `AuthzTokenInput::idp` is a mandatory `String`, not an `Option`, so there
+  is no call that compiles and omits it.
+- Principals with no recorded IdP fall back to `TOKEN_IDP`, which
+  `Config::from_env` refuses to let be empty (an EMPTY `idp` fails exactly
+  as silently as an absent one). Proven by
+  `exchange_falls_back_to_the_configured_idp_when_the_principal_has_none`,
+  run against both backends.
 
 ## Q14. `kid` is randomly regenerated on every key load (SETTLED, FIXED)
 

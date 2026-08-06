@@ -1,0 +1,70 @@
+# Dex configuration for epic-lore-authz's OIDC test suite
+# (crates/lore-authz-server/tests/oidc_flow.rs).
+#
+# THIS IS A TEST FIXTURE, NOT A DEPLOYMENT ARTIFACT. It is committed on
+# purpose so that a stranger who clones this repository can run the OIDC
+# tests with `docker compose -f docker-compose.test.yml run --rm --build
+# tests` and nothing else. Every value below is either a placeholder or a
+# throwaway; the client secret is a fixed, publicly-known test string and
+# must never be reused anywhere.
+#
+# ## Why Dex and not a mock
+# Dex is a real OpenID Connect provider: it signs real RS256 ID tokens with a
+# real key it publishes at a real JWKS endpoint, serves a real discovery
+# document, and enforces PKCE, redirect-URI registration, and one-time
+# authorization codes for real. This project has been burned before by
+# mocked tests passing while the real integration was broken (see
+# docs/protocol-notes.md), so the OIDC leg gets a genuine provider.
+#
+# Nothing about this config is Dex-specific from the test's point of view.
+# The test discovers every endpoint from /.well-known/openid-configuration,
+# exactly as it would against any other provider -- see
+# crates/lore-authz-server/src/oidc.rs's "provider-agnostic on purpose"
+# note. Pointing the same suite at a different IdP is a matter of changing
+# TEST_OIDC_* environment variables, not of changing test code.
+#
+# ## Why the mock CALLBACK connector
+# `mockCallback` is Dex's built-in connector that authenticates a fixed test
+# identity without an HTML login form. That keeps the test driving the real
+# OAuth2/OIDC protocol -- a real /auth redirect, a real authorization code, a
+# real token exchange, a real signed ID token -- while removing the one part
+# that would otherwise need HTML scraping and would break on any upstream
+# style change. The parts this project actually implements are all still
+# exercised end to end.
+
+issuer: http://dex:5556/dex
+
+storage:
+  type: memory
+
+web:
+  http: 0.0.0.0:5556
+
+oauth2:
+  # No consent screen: the test is not asserting anything about Dex's UI,
+  # and an interstitial page would only add HTML scraping.
+  skipApprovalScreen: true
+
+staticClients:
+  - id: epic-lore-authz-test
+    name: epic-lore-authz test client
+    # Throwaway, publicly known, test-only. A REAL client secret comes from
+    # configuration (OIDC_CLIENT_SECRET) and is never committed -- see
+    # docs/configuration.md.
+    secret: test-only-not-a-real-secret
+    # Must match TEST_OIDC_REDIRECT_URL in docker-compose.test.yml exactly.
+    # The test binds a real HTTP listener on this port inside its own
+    # container and follows the provider's redirect to it, so the whole
+    # browser leg is real -- Dex itself never dials this address, the test's
+    # HTTP client does.
+    redirectURIs:
+      - 'http://127.0.0.1:18080/oidc/callback'
+
+connectors:
+  - type: mockCallback
+    id: mock
+    name: Mock
+
+# No local password database: the mock connector above is the only way in,
+# which is what keeps the flow non-interactive.
+enablePasswordDB: false

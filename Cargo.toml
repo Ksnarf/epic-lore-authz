@@ -47,6 +47,14 @@ ring = { version = "0.17.4", features = ["std"] }
 # by hand in crates/lore-authz-server/src/signing.rs.
 base64 = "0.22"
 
+# reqwest: the OIDC client leg (PHASE 1b) -- discovery, the IdP's JWKS, and
+# the authorization-code token exchange. `rustls-tls-native-roots` rather
+# than the webpki-roots default so an enterprise IdP behind a private CA
+# works with the operator's own system trust store, matching the `tonic`
+# pin above (`tls-native-roots`). default-features = false drops the
+# blocking client, cookies, and charset guessing, none of which this uses.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
+
 axum = "0.8.4"
 tower = "0.5.2"
 tower-http = { version = "0.6.11", features = ["trace"] }

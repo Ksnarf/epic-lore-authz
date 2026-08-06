@@ -1,5 +1,6 @@
-# Throwaway test stack for epic-lore-authz's Postgres-backed test suite
-# (crates/lore-authz-server/tests/postgres_backed.rs).
+# Throwaway test stack for epic-lore-authz's real-dependency test suites:
+# a real Postgres (crates/lore-authz-server/tests/postgres_backed.rs) and a
+# real OpenID Connect provider (crates/lore-authz-server/tests/oidc_flow.rs).
 #
 # This is NOT a deployment artifact and must never be pointed at a shared or
 # long-lived database: `postgres` here uses a tmpfs data directory, so all
@@ -8,7 +9,7 @@
 # database it is given (see crates/lore-authz-server/src/db/mod.rs) -- so
 # reusing this same file against a real database would still be safe, but
 # there is no reason to: this compose file's whole point is a real Postgres
-# nobody has to provision or clean up by hand.
+# and a real IdP nobody has to provision or clean up by hand.
 #
 # Usage (PowerShell or any shell with Docker Compose v2):
 #   docker compose -f docker-compose.test.yml run --rm --build tests
@@ -17,7 +18,10 @@
 # The image built for `tests` is the same docker/Dockerfile.build used for
 # `cargo build`/`fmt`/`clippy` (see scripts/build.ps1 / build.sh) -- nothing
 # test-specific about the toolchain image itself, only the compose wiring
-# that gives it a real Postgres to talk to.
+# that gives it a real Postgres and a real IdP to talk to.
+#
+# EVERY credential below is a fixed, publicly-known, throwaway test value.
+# None of them is a secret, and none of them may be reused anywhere.
 
 services:
   postgres:
@@ -33,12 +37,41 @@ services:
       timeout: 3s
       retries: 30
 
+  # A REAL OpenID Connect provider for the login-flow suite: real discovery,
+  # a real RS256 signing key published at a real JWKS endpoint, real PKCE
+  # enforcement, real one-time authorization codes. See docker/dex/config.yaml
+  # for why this is a real IdP rather than a mock, and why nothing about the
+  # test is provider-specific.
+  dex:
+    image: ghcr.io/dexidp/dex:v2.44.0
+    command: ["dex", "serve", "/etc/dex/config.yaml"]
+    volumes:
+      - ./docker/dex/config.yaml:/etc/dex/config.yaml:ro
+    healthcheck:
+      # Dex's image has no shell utilities to speak of, but it does ship its
+      # own binary; `dex version` exiting 0 only proves the image runs, so
+      # this probes the discovery document over the loopback interface using
+      # the one HTTP client present in the image.
+      test:
+        [
+          "CMD",
+          "wget",
+          "--spider",
+          "-q",
+          "http://127.0.0.1:5556/dex/.well-known/openid-configuration",
+        ]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
   tests:
     build:
       context: .
       dockerfile: docker/Dockerfile.build
     depends_on:
       postgres:
+        condition: service_healthy
+      dex:
         condition: service_healthy
     working_dir: /work
     volumes:
@@ -49,4 +82,16 @@ services:
       # database this product owns or migrates in place of its own test
       # schema; see the module doc comment on this point.
       TEST_DATABASE_URL: postgres://postgres:test-only-not-a-real-secret@postgres:5432/postgres
+
+      # The OIDC login-flow suite. TEST_OIDC_ISSUER must match the `issuer`
+      # in docker/dex/config.yaml EXACTLY (the discovery document advertises
+      # it, and this project refuses a document whose issuer disagrees with
+      # the one it was fetched from -- OIDC Discovery section 4.3).
+      TEST_OIDC_ISSUER: http://dex:5556/dex
+      TEST_OIDC_CLIENT_ID: epic-lore-authz-test
+      TEST_OIDC_CLIENT_SECRET: test-only-not-a-real-secret
+      # Must match a registered redirectURI in docker/dex/config.yaml. The
+      # test binds a real listener here inside its own container; the IdP
+      # never dials it, the test's own HTTP client follows the redirect.
+      TEST_OIDC_REDIRECT_URL: http://127.0.0.1:18080/oidc/callback
     command: ["cargo", "test", "--workspace"]

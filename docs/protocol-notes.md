@@ -283,6 +283,45 @@ Consequences worth knowing:
   JWKS and in every JWT header leaks nothing the JWKS did not already
   publish.
 
+## 7f. The CLI's login deadline is 150 seconds, and it is client-side
+
+`lore-revision/src/auth/login.rs` polls `GetAuthSession` every
+`POLLING_INTERVAL_SECS` (5) up to `POLLING_MAX_RETRIES` (30) times and then
+returns a timeout. That is a hard **150-second budget for the entire browser
+login**, set in the CLI, and no server-side setting extends it.
+
+It matters because enterprise MFA can exceed it: a push notification to a
+phone in another room, a hardware-token PIN, or a first-time IdP consent
+screen can all take longer than two and a half minutes.
+
+This project does not try to work around it. `AUTH_SESSION_TTL_SECS`
+defaults to 300 -- deliberately double the CLI's budget -- so a user who
+finishes MFA late still lands on a success page and simply re-runs the
+login, which is fast the second time because the IdP session now exists. The
+only server-side alternatives would be long-polling (which
+`GetAuthSessionResponse`'s request/response shape does not support) or
+reporting progress this service does not have. See `docs/configuration.md`.
+
+## 7g. Nothing in the login flow is provider-specific
+
+`StartAuthSession` -> browser -> `GetAuthSession` is implemented on top of a
+generic OIDC relying party (`crates/lore-authz-server/src/oidc.rs`): every
+endpoint, the JWKS location, and the token-endpoint client-authentication
+method all come from the provider's own
+`/.well-known/openid-configuration`. There is no per-vendor branch, and
+adding one would be a bug.
+
+Two consequences worth writing down:
+
+- The identity key is the provider's `sub` claim, never the email address --
+  an email can be reassigned to a different human, a `sub` cannot. `sub` is
+  stored on `principals.subject` with a UNIQUE `(source, subject)` index, so
+  one IdP subject can never resolve to two principals.
+- The `idp` claim on minted AuthZ tokens is the provider's ISSUER URL. That
+  makes a raw token self-describing about which provider authenticated its
+  subject, and it is one fewer setting to keep in sync (see
+  `docs/open-questions.md` Q13, now SETTLED).
+
 ## 8. Stateless token revocation window
 
 Revoking a `role_binding` does not invalidate already-issued AuthZ tokens.
@@ -307,8 +346,12 @@ The integration test drives `lore-server` with `grpcurl`, not with the real
 - `docs/open-questions.md` Q1 (`UserToken.expires_at` units). Nothing in
   this test exercises `UserToken` on the wire at all -- the tokens are
   minted directly rather than fetched through
-  `StartAuthSession`/`GetAuthSession`, which are still
-  `Status::unimplemented` in this project.
+  `StartAuthSession`/`GetAuthSession`. **Partly closed since PHASE 1b**:
+  those RPCs now exist and produce a real `UserToken`, and the login suite
+  asserts `UserToken.expires_at == exp * 1000` (milliseconds, not seconds),
+  which is the same relationship `lore-credential/src/jwt.rs` implements on
+  the client side. What is still unproven is that the real CLI is HAPPY with
+  that value -- only a real `lore auth login` shows that.
 - QUIC. Only the gRPC/TCP listener was exercised. `lore-server` also serves
   QUIC on the same port number over UDP with its own auth path
   (`lore-server/src/quic/storage_service.rs` takes the same `JwtVerifier`),

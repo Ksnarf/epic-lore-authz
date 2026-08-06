@@ -101,15 +101,33 @@ docker compose -f docker-compose.test.yml down -v   # tear down the throwaway Po
 ```
 
 This runs every test in the workspace (`cargo test --workspace` is the
-compose service's command): unit tests, the lore-server compat suite, and
-the shared authz suite against both a real throwaway Postgres container AND
-a real throwaway SQLite file per test -- `docker-compose.test.yml` never
-touches a shared or long-lived database: `postgres` there uses a `tmpfs`
-data directory, the Postgres-backed tests each create their own
-randomly-named schema, and the SQLite-backed tests each get their own
-temp-file database, never a shared one. `.github/workflows/ci.yml` runs the
-same suite against a GitHub Actions Postgres service container on every
-push/PR (the SQLite tests need no service container at all).
+compose service's command): unit tests, the lore-server compat suite, the
+shared authz suite against both a real throwaway Postgres container AND a
+real throwaway SQLite file per test, and the OIDC login-flow suite against a
+real identity provider.
+
+`crates/lore-authz-server/tests/oidc_flow.rs` drives the browser login leg
+against a REAL OpenID Connect provider (Dex, in the `dex` compose service --
+see `docker/dex/config.yaml`): a real discovery document, real PKCE
+enforcement, real one-time authorization codes, and real RS256 ID tokens
+signed with a real key served from a real JWKS endpoint. Nothing in it mocks
+an HTTP response, and nothing in it is provider-specific -- every endpoint
+comes from the provider's own discovery document, so pointing the suite at a
+different IdP is a matter of changing `TEST_OIDC_*` variables, not test
+code. Its headline case binds this service's real axum router to a real
+socket and walks the entire flow with a redirect-following HTTP client, just
+as a browser would.
+
+`docker-compose.test.yml` never touches a shared or long-lived database:
+`postgres` there uses a `tmpfs` data directory, the Postgres-backed tests
+each create their own randomly-named schema, and the SQLite-backed tests
+each get their own temp-file database, never a shared one. Every credential
+in that file and in `docker/dex/config.yaml` is a fixed, publicly-known,
+throwaway test value.
+
+`.github/workflows/ci.yml` runs the same suite on every push/PR, against a
+GitHub Actions Postgres service container and the same Dex image and config
+file (the SQLite tests need no service container at all).
 
 ## Repository layout
 
