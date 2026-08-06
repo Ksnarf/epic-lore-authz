@@ -60,14 +60,25 @@ pub fn caller_principal_id(
         .and_then(strip_bearer)
         .ok_or_else(|| Status::unauthenticated("missing bearer token"))?;
 
-    let decoding_key = DecodingKey::from_jwk(&signing_keys.active().public_jwk)
-        .map_err(|err| Status::internal(format!("decoding own public JWK: {err}")))?;
+    // Deliberately coarse, matching crate::oidc's error design: the specific
+    // reason (a jsonwebtoken error kind -- InvalidSignature, InvalidIssuer,
+    // ExpiredSignature, ...) is logged, never returned. Returning it would
+    // let a caller distinguish expired vs bad-signature vs wrong-audience
+    // for free, which is a reconnaissance aid, not a debugging convenience
+    // owed to an untrusted caller.
+    let decoding_key = DecodingKey::from_jwk(&signing_keys.active().public_jwk).map_err(|err| {
+        tracing::error!(error = %err, "decoding this service's own public JWK failed");
+        Status::internal("internal error")
+    })?;
     let mut validation = Validation::new(Algorithm::ES256);
     validation.set_issuer(&[issuer]);
     validation.set_audience(audience);
 
     let claims = decode::<SubjectClaim>(token, &decoding_key, &validation)
-        .map_err(|err| Status::unauthenticated(format!("invalid bearer token: {err}")))?
+        .map_err(|err| {
+            tracing::debug!(error = %err, "bearer token failed signature/claim validation");
+            Status::unauthenticated("invalid bearer token")
+        })?
         .claims;
 
     Uuid::parse_str(&claims.subject)
@@ -148,5 +159,46 @@ mod tests {
         )
         .expect_err("an unparseable token must deny");
         assert_eq!(err.code(), tonic::Code::Unauthenticated);
+        assert_eq!(err.message(), "invalid bearer token");
+    }
+
+    /// A well-formed, correctly-signed token that fails validation for a
+    /// SPECIFIC reason (here: wrong audience) must still surface a single
+    /// generic message. Without this, the caller-visible error would
+    /// distinguish "wrong audience" from "expired" from "bad signature" --
+    /// each is a different jsonwebtoken `ErrorKind`, and its `Display` is
+    /// exactly what an attacker probing for a working token would want for
+    /// free.
+    #[test]
+    fn a_token_that_fails_claim_validation_denies_with_the_same_generic_message() {
+        let store = store();
+        let signed = mint_authz_token(
+            store.active(),
+            ISSUER,
+            &["some-other-audience-entirely".to_string()],
+            "dev",
+            3600,
+            &AuthzTokenInput {
+                user_id: Uuid::new_v4().to_string(),
+                name: "Test User".to_string(),
+                preferred_username: "testuser".to_string(),
+                is_service_account: false,
+                idp: "dev-test-idp".to_string(),
+                groups: None,
+                resources: vec![],
+            },
+        )
+        .unwrap();
+
+        let bearer = format!("Bearer {}", signed.token);
+        let err = caller_principal_id(Some(&bearer), &store, ISSUER, &[AUDIENCE.to_string()])
+            .expect_err("a token signed for a different audience must deny");
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+        assert_eq!(
+            err.message(),
+            "invalid bearer token",
+            "the message must not name the specific validation failure (e.g. jsonwebtoken's \
+             InvalidAudience), or a caller could distinguish failure reasons for free"
+        );
     }
 }
