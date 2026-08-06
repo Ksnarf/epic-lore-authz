@@ -184,14 +184,32 @@ do not flip a task to `[x]` without that proof; see the individual gate notes.
       (`lore_transport::grpc::CORRELATION_ID_HEADER`). Confirmed at runtime
       (integration tooling held locally), not just read. See
       `docs/open-questions.md` Q3 and `docs/protocol-notes.md` #7d.
-- [ ] NEW (from the 2026-08-03 integration run): make `kid` deterministic.
-      `signing.rs` mints a random `Uuid::new_v4()` `kid` on every key load,
-      so two replicas loading the same `SIGNING_KEY_SOURCE` publish
+- [x] NEW (from the 2026-08-03 integration run): make `kid` deterministic.
+      `signing.rs` minted a random `Uuid::new_v4()` `kid` on every key load,
+      so two replicas loading the same `SIGNING_KEY_SOURCE` published
       different `kid`s for the same key and cross-replica token validation
-      fails with `KeyNotFound`. Fix by deriving `kid` from an RFC 7638 JWK
-      thumbprint. Blocks nothing in Phase 0 (single process), MUST be
-      settled before Phase 1 key rotation. See `docs/open-questions.md`
-      Q14 / `docs/protocol-notes.md` #7e.
+      failed with `KeyNotFound`. Fixed by deriving `kid` from an RFC 7638
+      JWK thumbprint. See `docs/open-questions.md` Q14 (now SETTLED) /
+      `docs/protocol-notes.md` #7e.
+      [verified-e2e] (unit level, real key material -- not a deployment
+      claim) `crates/lore-authz-server/src/signing.rs`'s
+      `rfc7638_p256_thumbprint`: `base64url(SHA-256(canonical JWK JSON))`
+      over exactly the members RFC 7638 section 3.2 requires for an EC key
+      (`crv`, `kty`, `x`, `y`), lexicographic, no whitespace. Three tests
+      added, all passing in the pinned build image (`cargo test --workspace
+      --lib`: 33 passed, up from 30):
+      `signing::tests::same_key_material_yields_an_identical_kid_across_two_independent_loads`
+      (writes a real PKCS#8 EC P-256 key to disk, loads it through two
+      INDEPENDENT `SigningKeyStore::load` calls -- the multi-replica case in
+      miniature -- and asserts both the `kid` field and the published JWKS
+      `kid` are identical),
+      `signing::tests::different_key_material_yields_a_different_kid` (so a
+      hardcoded constant could not pass the first test), and
+      `signing::tests::thumbprint_is_a_43_char_base64url_sha256_over_the_canonical_member_order`
+      (pins the algorithm shape so a refactor cannot silently redefine
+      `kid`). `signing::tests::non_file_source_generates_ephemeral_key` was
+      updated: `kid` is now 43 base64url chars and no longer parses as a
+      UUID.
 
 **Phase 0 exit gate**: the integration test above passes against an
 unmodified upstream `lore-server` binary and unmodified `lore` CLI. Nothing

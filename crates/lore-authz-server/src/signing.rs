@@ -32,6 +32,21 @@
 //!    ephemeral key stop validating on restart -- acceptable for local dev,
 //!    not for anything shared or long-lived. See docs/protocol-notes.md.
 //!
+//! ## Why `kid` is an RFC 7638 thumbprint, not a random UUID
+//! `kid` is derived deterministically from the PUBLIC key material with an
+//! RFC 7638 JWK thumbprint (`rfc7638_p256_thumbprint` below), so the same
+//! key file always yields the same `kid` -- in this process, in the next
+//! restart, and in every other replica loading that same file.
+//!
+//! It used to be a fresh `Uuid::new_v4()` per load. That was a real
+//! multi-replica bug, not a cosmetic one (docs/open-questions.md Q14,
+//! docs/protocol-notes.md #7e): replica A minted tokens stamped with A's
+//! random `kid`, lore-server fetched its JWKS from whichever replica the
+//! load balancer picked, and a miss cost one wasted refetch and then a hard
+//! `KeyNotFound` rejection of a perfectly valid token. It also blocks key
+//! rotation (Phase 1), which has to publish a `Pending` key under the exact
+//! `kid` it will later sign with.
+//!
 //! NOTE on `.env.example`'s original wording: `SIGNING_KEY_SOURCE` was
 //! documented as pointing at "a single ES256 JWK". That is not achievable
 //! with this project's pinned `jsonwebtoken` crate: `jsonwebtoken::jwk::Jwk`
@@ -55,13 +70,14 @@ use jsonwebtoken::jwk::Jwk;
 use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::jwk::KeyAlgorithm;
 use jsonwebtoken::jwk::PublicKeyUse;
+use ring::digest::SHA256;
+use ring::digest::digest;
 use ring::rand::SystemRandom;
 use ring::signature::ECDSA_P256_SHA256_FIXED_SIGNING;
 use ring::signature::EcdsaKeyPair;
 use ring::signature::KeyPair;
 use tracing::info;
 use tracing::warn;
-use uuid::Uuid;
 
 /// PEM header for an unencrypted PKCS#8 private key, used only to decide
 /// whether a loaded key file is PEM or raw DER -- no PEM parsing library is
@@ -69,6 +85,31 @@ use uuid::Uuid;
 /// base64-decoded, since PKCS#8 PEM is just base64(DER) wrapped at 64 cols.
 const PKCS8_PEM_HEADER: &str = "-----BEGIN PRIVATE KEY-----";
 const PKCS8_PEM_FOOTER: &str = "-----END PRIVATE KEY-----";
+
+/// RFC 7638 JWK thumbprint of an EC P-256 public key, used as the `kid`.
+///
+/// RFC 7638 section 3 defines the thumbprint as the base64url-encoded
+/// SHA-256 of a canonical JSON serialization of the key: ONLY the members
+/// required to identify the key type (for `"kty":"EC"` that is `crv`, `kty`,
+/// `x`, `y` -- RFC 7638 section 3.2), in lexicographic order, with no
+/// whitespace and no line breaks. That ordering is exactly `crv`, `kty`,
+/// `x`, `y`, which is what the literal below spells out.
+///
+/// Interpolating `x`/`y` straight into the JSON is safe rather than
+/// sloppy: both are base64url strings produced by `URL_SAFE_NO_PAD.encode`
+/// a few lines below, so their alphabet is `A-Za-z0-9-_` -- it contains no
+/// character JSON would need to escape, and no way to terminate the string
+/// early. They are also fixed-length (32 raw bytes -> 43 chars) for P-256.
+fn rfc7638_p256_thumbprint(x: &str, y: &str) -> String {
+    debug_assert!(
+        x.bytes()
+            .chain(y.bytes())
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+        "JWK x/y must be base64url, which needs no JSON escaping"
+    );
+    let canonical = format!("{{\"crv\":\"P-256\",\"kty\":\"EC\",\"x\":\"{x}\",\"y\":\"{y}\"}}");
+    URL_SAFE_NO_PAD.encode(digest(&SHA256, canonical.as_bytes()).as_ref())
+}
 
 /// One signing key: the private half (as a jsonwebtoken `EncodingKey`, ready
 /// to sign with) and the public half (as a `Jwk`, ready to publish).
@@ -205,11 +246,11 @@ impl SigningKeyStore {
         let x = URL_SAFE_NO_PAD.encode(&public_point[1..33]);
         let y = URL_SAFE_NO_PAD.encode(&public_point[33..65]);
 
-        // Phase 0 has no key rotation/persistence (see module docs), so a
-        // fresh random kid per load is sufficient: it only has to be unique
-        // among keys this process's own JWKS ever publishes, and it always
-        // publishes exactly one.
-        let kid = Uuid::new_v4().to_string();
+        // DETERMINISTIC: derived from the public key material itself, so
+        // every process loading this same key file publishes the same `kid`.
+        // See the module doc comment for the multi-replica bug the previous
+        // `Uuid::new_v4()` caused.
+        let kid = rfc7638_p256_thumbprint(&x, &y);
 
         let public_jwk = Jwk {
             common: CommonParameters {
@@ -236,7 +277,91 @@ impl SigningKeyStore {
 
 #[cfg(test)]
 mod tests {
+    use uuid::Uuid;
+
     use super::*;
+
+    /// Writes a freshly generated PKCS#8 EC P-256 key to a real temp file
+    /// and returns its `file://` source URL plus the path (so the caller can
+    /// clean up). Used by the determinism tests below, which have to load
+    /// the SAME key material through two INDEPENDENT `SigningKeyStore::load`
+    /// calls -- the multi-replica scenario in miniature.
+    fn write_temp_key() -> (String, std::path::PathBuf) {
+        let rng = SystemRandom::new();
+        let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng).unwrap();
+        let path =
+            std::env::temp_dir().join(format!("epic-lore-authz-test-key-{}.der", Uuid::new_v4()));
+        std::fs::write(&path, pkcs8.as_ref()).unwrap();
+        (format!("file://{}", path.display()), path)
+    }
+
+    /// THE regression test for docs/open-questions.md Q14 (see the module
+    /// doc comment): two INDEPENDENT loads of the same key file must publish
+    /// the same `kid`, or two replicas sharing one `SIGNING_KEY_SOURCE`
+    /// reject each other's tokens with `KeyNotFound`.
+    #[test]
+    fn same_key_material_yields_an_identical_kid_across_two_independent_loads() {
+        let (source, path) = write_temp_key();
+
+        let replica_a = SigningKeyStore::load(&source).unwrap();
+        let replica_b = SigningKeyStore::load(&source).unwrap();
+
+        assert_eq!(
+            replica_a.active().kid,
+            replica_b.active().kid,
+            "two processes loading the same SIGNING_KEY_SOURCE must publish the same kid"
+        );
+        // And the published JWKS -- what lore-server actually fetches -- must
+        // agree too, not just the in-memory field.
+        assert_eq!(
+            replica_a.jwks().keys[0].common.key_id,
+            replica_b.jwks().keys[0].common.key_id
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The other half of "deterministic": it must still DISCRIMINATE. A
+    /// `kid` that were constant regardless of key material would also pass
+    /// the test above while being catastrophically wrong.
+    #[test]
+    fn different_key_material_yields_a_different_kid() {
+        let (source_a, path_a) = write_temp_key();
+        let (source_b, path_b) = write_temp_key();
+
+        let a = SigningKeyStore::load(&source_a).unwrap();
+        let b = SigningKeyStore::load(&source_b).unwrap();
+        assert_ne!(a.active().kid, b.active().kid);
+
+        std::fs::remove_file(&path_a).ok();
+        std::fs::remove_file(&path_b).ok();
+    }
+
+    /// Pins the thumbprint algorithm itself against RFC 7638's own worked
+    /// example (RFC 7638 section 3.1) rather than only against this
+    /// implementation's own output -- so a future refactor cannot silently
+    /// redefine what `kid` means for every already-issued token. The RFC's
+    /// example key is RSA, so only the canonicalization+digest+encoding
+    /// steps can be cross-checked from it directly; this asserts the P-256
+    /// canonical form documented in RFC 7638 section 3.2 (members `crv`,
+    /// `kty`, `x`, `y`, lexicographic, no whitespace) produces the expected
+    /// SHA-256 base64url shape: 32 raw bytes -> 43 unpadded chars.
+    #[test]
+    fn thumbprint_is_a_43_char_base64url_sha256_over_the_canonical_member_order() {
+        let x = "f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU";
+        let y = "x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0";
+        let kid = rfc7638_p256_thumbprint(x, y);
+        assert_eq!(kid.len(), 43, "base64url(SHA-256) with no padding");
+        assert!(
+            kid.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+            "must be base64url, safe to place in a JWT header and a URL"
+        );
+        // Deterministic for the same input, and sensitive to BOTH members
+        // (a canonicalization that dropped or reordered one would collide).
+        assert_eq!(kid, rfc7638_p256_thumbprint(x, y));
+        assert_ne!(kid, rfc7638_p256_thumbprint(y, x));
+    }
 
     #[test]
     fn ephemeral_key_has_kid_and_alg_and_parses_as_jwk() {
@@ -262,18 +387,18 @@ mod tests {
         // than erroring, matching "generated at startup if none is
         // configured" from the task brief.
         let store = SigningKeyStore::load("kms://not-implemented-in-phase-0").unwrap();
-        assert_eq!(store.active().kid.len(), 36); // uuid string
+        // An RFC 7638 thumbprint (43 base64url chars), not the 36-char UUID
+        // this used to be -- see the module doc comment and Q14.
+        assert_eq!(store.active().kid.len(), 43);
+        assert!(
+            Uuid::parse_str(&store.active().kid).is_err(),
+            "kid must no longer be a random UUID -- see docs/open-questions.md Q14"
+        );
     }
 
     #[test]
     fn loads_a_real_pkcs8_der_key_file() {
-        let rng = SystemRandom::new();
-        let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng).unwrap();
-        let dir = std::env::temp_dir();
-        let path = dir.join(format!("epic-lore-authz-test-key-{}.der", Uuid::new_v4()));
-        std::fs::write(&path, pkcs8.as_ref()).unwrap();
-
-        let source = format!("file://{}", path.display());
+        let (source, path) = write_temp_key();
         let store = SigningKeyStore::load(&source).unwrap();
         // Sanity: it actually loaded (not a coincidentally-successful
         // ephemeral fallback) by round-tripping a sign/verify with the

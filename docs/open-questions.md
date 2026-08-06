@@ -213,20 +213,36 @@ Whatever design answers this question must make it structurally impossible
 to mint an AuthZ token without `idp` -- which is why `AuthzTokenInput::idp`
 is a mandatory `String` today, not an `Option`.
 
-## Q14. `kid` is randomly regenerated on every key load (NEW, needs fixing)
+## Q14. `kid` is randomly regenerated on every key load (SETTLED, FIXED)
 
 Found while building the Phase 0 integration test.
-`crates/lore-authz-server/src/signing.rs`'s `key_from_pkcs8_der` assigns a
-fresh `Uuid::new_v4()` as the `kid` each time it runs, so two processes
-loading the SAME `SIGNING_KEY_SOURCE` file publish different `kid` values
-for the same key. Single-process Phase 0 is unaffected (it is why
-`dev-mint-token` takes an explicit `--kid`), but any multi-replica
-deployment breaks: a token minted by replica A carries A's `kid`, and a
+`crates/lore-authz-server/src/signing.rs`'s `key_from_pkcs8_der` used to
+assign a fresh `Uuid::new_v4()` as the `kid` each time it ran, so two
+processes loading the SAME `SIGNING_KEY_SOURCE` file published different
+`kid` values for the same key. Single-process Phase 0 was unaffected (it is
+why `dev-mint-token` takes an explicit `--kid`), but any multi-replica
+deployment broke: a token minted by replica A carries A's `kid`, and a
 lore-server that fetched its JWKS from replica B rejects it with
 `KeyNotFound` after one wasted refetch.
 
-Proposed fix: derive `kid` deterministically from the public key material
-(RFC 7638 JWK thumbprint). That also makes `kid` stable across restarts,
-which key rotation (Phase 1) needs anyway -- a `Pending` key has to be
-published under the `kid` it will later sign with. Settle before Phase 1
-rotation work starts. See `docs/protocol-notes.md` #7e.
+**SETTLED (Phase 1b): fixed by deriving `kid` from an RFC 7638 JWK
+thumbprint** -- `base64url(SHA-256(canonical JWK JSON))` over exactly the
+members RFC 7638 section 3.2 requires for an EC key (`crv`, `kty`, `x`,
+`y`), lexicographically ordered, no whitespace. See
+`rfc7638_p256_thumbprint` in `crates/lore-authz-server/src/signing.rs` and
+`docs/protocol-notes.md` #7e.
+
+Proven, not asserted: `signing::tests::
+same_key_material_yields_an_identical_kid_across_two_independent_loads`
+loads one real on-disk PKCS#8 key file through two INDEPENDENT
+`SigningKeyStore::load` calls (the multi-replica scenario in miniature) and
+asserts both the in-memory `kid` and the published JWKS `kid` match;
+`different_key_material_yields_a_different_kid` proves a trivially-constant
+`kid` could not pass that test; and
+`thumbprint_is_a_43_char_base64url_sha256_over_the_canonical_member_order`
+pins the algorithm shape itself so a later refactor cannot silently
+redefine `kid` for already-issued tokens.
+
+Note the shape change: `kid` is now 43 base64url characters, not a
+36-character UUID. That also unblocks Phase 1 key rotation, which has to
+publish a `Pending` key under the exact `kid` it will later sign with.

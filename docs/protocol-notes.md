@@ -245,22 +245,43 @@ correlation ID injection is now a no-op at this layer", so the real `lore`
 CLI does not appear to set this header today -- the server generates one.
 The header is honoured when present regardless of who sets it.
 
-## 7e. `SIGNING_KEY_SOURCE` produces a NEW random `kid` on every load
+## 7e. `kid` is an RFC 7638 JWK thumbprint (FIXED in Phase 1b)
 
-Not a lore-protocol fact, a fact about this project that the integration
-test forced into the open. `signing.rs`'s `key_from_pkcs8_der` assigns
-`Uuid::new_v4()` as the `kid` every time a key is loaded. Two processes
-loading the SAME private key file therefore publish DIFFERENT `kid` values
-for the same key. That is harmless for a single Phase 0 process, and it is
-why `dev-mint-token` has to be handed the running server's `kid` explicitly.
+Not a lore-protocol fact, a fact about this project that the Phase 0
+integration test forced into the open, and fixed in Phase 1b.
 
-It is a real bug for any multi-replica deployment: a token minted by replica
-A carries A's `kid`, lore-server fetches the JWKS from whichever replica the
+**The bug (historical):** `signing.rs`'s `key_from_pkcs8_der` used to assign
+`Uuid::new_v4()` as the `kid` every time a key was loaded. Two processes
+loading the SAME private key file therefore published DIFFERENT `kid` values
+for the same key. Harmless for a single Phase 0 process (and why
+`dev-mint-token` has to be handed the running server's `kid` explicitly),
+but a real bug for any multi-replica deployment: a token minted by replica A
+carries A's `kid`, lore-server fetches the JWKS from whichever replica the
 load balancer picks, and a miss costs one refetch and then a hard
-`KeyNotFound` rejection. Tracked as `docs/open-questions.md` Q14; the fix is
-to derive `kid` deterministically from the key material (an RFC 7638 JWK
-thumbprint), which also makes the `kid` stable across restarts. Must be
-settled before Phase 1 ships key rotation.
+`KeyNotFound` rejection of a perfectly valid token.
+
+**The fix:** `kid` is now the RFC 7638 JWK thumbprint of the public key --
+`base64url(SHA-256(canonical JWK JSON))`, where the canonical JSON contains
+only the members RFC 7638 section 3.2 requires for `"kty":"EC"` (`crv`,
+`kty`, `x`, `y`), in lexicographic order with no whitespace. The same key
+material therefore always produces the same `kid`, in every replica and
+across restarts. Proven by
+`signing::tests::same_key_material_yields_an_identical_kid_across_two_independent_loads`
+(two independent `SigningKeyStore::load` calls against one real on-disk key
+file) plus `different_key_material_yields_a_different_kid` (so a constant
+`kid` could not pass the first test).
+
+Consequences worth knowing:
+
+- `kid` changed shape: 43 base64url characters, not a 36-character UUID.
+  Anything that hardcoded a UUID-shaped `kid` (nothing in this repo does)
+  breaks.
+- Key rotation (Phase 1) can now publish a `Pending` key under the exact
+  `kid` it will later sign with, which is the whole point of pre-publishing
+  it (see section 4).
+- The thumbprint is over PUBLIC key material only, so publishing it in the
+  JWKS and in every JWT header leaks nothing the JWKS did not already
+  publish.
 
 ## 8. Stateless token revocation window
 
