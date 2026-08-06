@@ -11,13 +11,21 @@
 //! signed by this service's own key and resolves it to a `principals` row.
 //! That does not fit this hop: `lore-server` is the caller here, not an end
 //! user, and it has no `principals` row of its own to resolve to. More to
-//! the point, reading the pinned fork's actual client code confirms there is
-//! nothing to verify: `lore-server/src/authnz/rebac.rs`'s
-//! `RebacClientHelper` builds its gRPC channel with ONLY a
-//! `CorrelationInterceptor` (tracing correlation id) -- no bearer token, no
-//! client TLS identity, no header of any kind is attached to
-//! `create_resource` / `delete_resource` calls. Reusing the JWT pattern here
-//! would mean verifying a token `lore-server` never sends.
+//! the point, reading the upstream `lore-server` client code this project
+//! integrates against shows the wrong KIND of credential arrives, not the
+//! absence of one. `lore-server/src/authnz/rebac.rs`'s `RebacClientHelper`
+//! builds its gRPC channel with only a `CorrelationInterceptor` (tracing
+//! correlation id), but the call sites (`repository_create_auth_resource` /
+//! `repository_delete_auth_resource`) build their requests through
+//! `create_request_with_authorization`, so what actually lands on this hop
+//! is the END USER's own bearer token, forwarded verbatim from the request
+//! that triggered the repository create or delete. That is a user
+//! credential, not a service one: verifying it the way
+//! `caller_principal_id` does would authenticate the human, not
+//! `lore-server`, and would let any user who can reach `RepositoryCreate`
+//! call `CreateResource` directly with that same token. The caller on this
+//! hop is `lore-server` acting on its own behalf, and it has no
+//! `principals` row to resolve to.
 //!
 //! ## What this uses instead
 //!
@@ -40,15 +48,28 @@
 //!
 //! ## Known operational gap, stated honestly
 //!
-//! The pinned/unmodified upstream `lore-server` binary this project
-//! integrates against does NOT send this (or any) header on this hop (see
-//! above). Enabling `REBAC_SERVICE_TOKEN` is therefore a genuine deployment
-//! requirement, not just a config flip: something has to sit between
-//! `lore-server` and this port to attach the header -- e.g. a sidecar or
-//! reverse proxy the operator controls on the path `lore-server`'s
-//! `auth_url` dials, since that URL does not have to point directly at this
-//! service's raw listener. Making `lore-server` itself attach this header is
-//! a change to a different repository (`epic-lore`), out of scope here; see
+//! By default `lore-server` forwards the end user's own bearer token on
+//! this hop rather than a service credential (see above), so
+//! `REBAC_SERVICE_TOKEN` alone does nothing for a deployment where nothing
+//! on `lore-server`'s side replaces that token with one.
+//!
+//! An optional `[server.auth] rebac_service_token` setting exists as a
+//! not-yet-upstreamed patch on the `epic-lore` repository's
+//! `feat/rebac-service-token` branch (`epic-lore` is `lore-server`'s own,
+//! separate repository, not part of this project). When configured, it
+//! makes `lore-server`'s rebac client replace the forwarded caller token
+//! with `authorization: Bearer <token>` on this hop only; when absent,
+//! behavior is unchanged from the paragraph above. Proven end to end on
+//! 2026-08-06: the correct token lets `RepositoryCreate` succeed and
+//! creates a row in this service's `resources` table; a wrong token is
+//! rejected; leaving the setting unset leaves behavior unchanged.
+//!
+//! Deployments running a stock, unpatched `lore-server` binary are still
+//! affected: they have no config surface to send a service credential at
+//! all, so the caller's own token still lands here, and something else on
+//! the network path -- e.g. a sidecar or reverse proxy the operator
+//! controls -- is still needed to attach a real header before
+//! `REBAC_SERVICE_TOKEN` here does anything for them. See
 //! `docs/open-questions.md` Q6 for the full writeup and `docs/
 //! configuration.md`'s `REBAC_SERVICE_TOKEN` entry for the config surface.
 //! What this module guarantees on ITS side of that boundary is narrow but
