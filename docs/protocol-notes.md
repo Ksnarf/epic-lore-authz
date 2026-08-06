@@ -331,6 +331,33 @@ operators -- it is the main security caveat of a stateless-token design. A
 `jti` denylist is possible later but requires `lore-server` support it does
 not currently have.
 
+## 8a. `ExchangeUserTokenForMultiresourceToken` refuses an AuthZ-shaped input token
+
+Security review finding: `caller::caller_principal_id` decodes ONLY the
+`sub` claim, which is present on both claim shapes (`AuthzClaims` and
+`AuthnClaims`, see section 2). On its own that means a caller's own
+previously-minted AuthZ token verifies at this endpoint just as well as a
+real AuthN token would -- nothing forced the input to be AuthN-shaped.
+
+Confirmed NOT to be privilege escalation: `resources` is recomputed fresh
+from real grants on every exchange, and `resolve_caller` still denies a
+principal whose status is no longer `active`. What it WOULD allow, if left
+unfixed, is unbounded AuthZ-token renewal for the entire life of the
+original AuthN token -- re-exchanging an AuthZ token for a fresh one
+indefinitely, well past the AuthZ token's own short TTL (see section 8).
+That is undesirable on its own even without being an authorization bug, so
+the decision made here is to REFUSE an AuthZ-shaped token at this endpoint
+outright (`Status::invalid_argument`) rather than accept it deliberately.
+
+Detection is `caller::is_authz_shaped_token`: `idp` is mandatory on
+`AuthzClaims` and absent from `AuthnClaims`, so its presence on an
+already-would-be-valid token is the shape signal, without needing two
+different decode targets. Enforced in `grpc.rs`'s
+`exchange_user_token_for_multiresource_token`, before `resolve_caller` runs.
+Pinned by `exchange_denies_an_authz_shaped_token_presented_for_renewal`
+(`tests/authz_suite/mod.rs`, both backends) so this choice cannot regress
+back to silent acceptance.
+
 ## 9. What the integration test still does NOT cover
 
 The integration test drives `lore-server` with `grpcurl`, not with the real

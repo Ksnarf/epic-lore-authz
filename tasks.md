@@ -290,6 +290,16 @@ integration test has actually been run and its output logged.
       and `Config::from_env` refuses to start if `TOKEN_IDP` is empty.
       A caller entitled to nothing gets a well-formed token whose
       `resources` is empty -- never an error, never someone else's access.
+      **Security review addition**: an AuthZ-shaped token presented here
+      (instead of an AuthN token) is now refused outright
+      (`Status::invalid_argument`), rather than silently accepted for
+      renewal -- see `docs/protocol-notes.md` #8a and
+      `caller::is_authz_shaped_token`. Confirmed not privilege escalation
+      (resources are still recomputed fresh and a suspended principal is
+      still denied); the concern was unbounded renewal, which is now closed.
+      [verified-e2e]
+      `exchange_denies_an_authz_shaped_token_presented_for_renewal`
+      (both backends).
 - [x] 13 new tests, run against BOTH backends (26 test executions), all
       passing. [verified-e2e] Added to the SHARED `tests/authz_suite/mod.rs`
       so Postgres and SQLite cannot drift: `poll_returns_an_authn_token_

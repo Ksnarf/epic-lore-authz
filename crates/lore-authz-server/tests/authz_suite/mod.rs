@@ -1605,6 +1605,40 @@ pub async fn exchange_denies_every_unauthenticated_caller(backend: Backend) {
     assert_eq!(err.code(), Code::Unauthenticated);
 }
 
+/// Security review finding (docs/protocol-notes.md #8a): a caller's own
+/// previously-minted AuthZ token must NOT be accepted at this endpoint as
+/// if it were an AuthN token. Without this, a caller could re-exchange an
+/// AuthZ token for a fresh one indefinitely, for the life of the original
+/// AuthN token -- unbounded renewal well past the AuthZ token's own short
+/// TTL. Pinned here so the chosen behavior (refuse) cannot change silently;
+/// see `caller::is_authz_shaped_token` and `grpc.rs` for where it is
+/// enforced.
+pub async fn exchange_denies_an_authz_shaped_token_presented_for_renewal(backend: Backend) {
+    let h = Harness::new(backend).await;
+    let user = Uuid::new_v4();
+    h.create_user(user, "Renewing User").await;
+    h.create_resource("urc-renewal").await;
+    h.grant_specific(ROLE_READER, "urc-renewal", "user", user)
+        .await;
+
+    // `request_with_bearer` mints an AuthZ token (idp set, resources
+    // claim present) -- exactly the shape this endpoint must refuse when
+    // presented as the input token, as opposed to `request_with_authn_
+    // bearer`'s AuthN shape, which the two positive-path exchange tests
+    // above use successfully against the same endpoint.
+    let err = h
+        .auth_service
+        .exchange_user_token_for_multiresource_token(h.request_with_bearer(
+            epic_urc::ExchangeUserTokenForMultiresourceTokenRequest {
+                resource_id: vec!["urc-renewal".to_string()],
+            },
+            user,
+        ))
+        .await
+        .expect_err("an AuthZ-shaped token presented for renewal must be refused");
+    assert_eq!(err.code(), Code::InvalidArgument);
+}
+
 pub async fn migrations_are_idempotent(backend: Backend) {
     // `Db::connect` already ran migrations once (in `fresh_db`); running
     // them again against the SAME database must be a no-op, not an error --

@@ -207,6 +207,12 @@ async fn exchange_denies_every_unauthenticated_caller() {
 }
 
 #[tokio::test]
+async fn exchange_denies_an_authz_shaped_token_presented_for_renewal() {
+    authz_suite::exchange_denies_an_authz_shaped_token_presented_for_renewal(Backend::Postgres)
+        .await
+}
+
+#[tokio::test]
 async fn start_auth_session_without_a_provider_denies_against_real_db() {
     authz_suite::start_auth_session_without_a_provider_denies_against_real_db(Backend::Postgres)
         .await

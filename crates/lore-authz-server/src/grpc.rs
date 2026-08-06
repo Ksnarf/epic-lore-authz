@@ -255,8 +255,12 @@ impl epic_urc::urc_auth_api_server::UrcAuthApi for AuthApiService {
     // as `authorization: Bearer <token>` and mints the AuthZ token carrying
     // the `resources` claim that lore-server actually enforces.
     //
-    // Three details that are load-bearing rather than incidental:
+    // Four details that are load-bearing rather than incidental:
     //
+    //  * An AuthZ-shaped token presented here (rather than an AuthN token)
+    //    is refused outright, not silently re-exchanged -- see the security
+    //    review note at this function's own `is_authz_shaped_token` check
+    //    below and docs/protocol-notes.md #8a.
     //  * `idp` is recovered from the PRINCIPAL ROW, not from the caller's
     //    AuthN token -- that token has no `idp` field at all
     //    (docs/protocol-notes.md #7b, docs/open-questions.md Q13, now
@@ -280,6 +284,32 @@ impl epic_urc::urc_auth_api_server::UrcAuthApi for AuthApiService {
         let db = self.require_db()?.clone();
         let authorization = authorization_header(&request);
         let req = request.into_inner();
+
+        // Security review remediation (see docs/protocol-notes.md #8a): this
+        // endpoint exchanges an AuthN token for an AuthZ token, and an
+        // AuthZ-shaped token presented here would let a caller renew an
+        // AuthZ token indefinitely for the life of the original AuthN
+        // token -- well past the AuthZ token's own short TTL. Confirmed NOT
+        // privilege escalation (`resources` below is recomputed fresh from
+        // real grants, and `resolve_caller` still denies a suspended
+        // principal), but unbounded renewal is undesirable on its own, so
+        // it is refused outright rather than accepted silently. A missing
+        // or otherwise-invalid token is simply not AuthZ-shaped here and
+        // falls through to `resolve_caller`, which denies it properly.
+        if caller::is_authz_shaped_token(
+            authorization.as_deref(),
+            &self.signing_keys,
+            &self.jwt_issuer,
+            &self.jwt_audience,
+        ) {
+            tracing::warn!(
+                "ExchangeUserTokenForMultiresourceToken was presented an AuthZ-shaped token; \
+                 refusing to renew a renewal"
+            );
+            return Err(Status::invalid_argument(
+                "token exchange requires an AuthN token, not a previously issued AuthZ token",
+            ));
+        }
 
         let principal = self
             .resolve_caller(&db, authorization.as_deref(), None)
