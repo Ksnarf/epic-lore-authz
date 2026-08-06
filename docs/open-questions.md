@@ -110,14 +110,30 @@ project's implementation does not yet do anything with it.
 
 `lore-server/src/authnz/common.rs`'s
 `create_request_with_authorization` appends an *empty* `authorization`
-header when no token is supplied, rather than omitting the header, per an
-upstream test (`can_create_request_without_authorization`). This suggests
-`RebacApi.CreateResource` / `DeleteResource` calls from `lore-server` may
-carry no real bearer token at all. This determines how the
-server-to-sidecar hop is authenticated: an empty `authorization` value
-must be treated as **absent, not malformed**, and the design plan
-recommends gating this hop with mTLS or a shared secret rather than
-expecting a user token.
+header only when no token is supplied, rather than omitting the header,
+per an upstream test (`can_create_request_without_authorization`). Reading
+the actual call sites shows a token is normally supplied here:
+`repository_create_auth_resource` / `repository_delete_auth_resource`
+(`lore-server/src/authnz/rebac.rs`) build their `RebacApi` requests through
+this same helper using the END USER's own bearer token, forwarded verbatim
+from the request that triggered the repository create or delete.
+`RebacClientHelper` itself sets up its gRPC channel with only a
+`CorrelationInterceptor` (tracing correlation id) and no client TLS
+identity, so the empty-header path is a real code path but not the one
+that runs on a normal `CreateResource`/`DeleteResource` call.
+
+So the real finding was never "no header, no credential" -- there is a
+header, and it carries a real, verifiable bearer token. The issue is the
+credential's KIND: it authenticates the end user who triggered the
+repository create/delete, and `lore-server` itself has no `principals` row
+to resolve to. Verifying it the way a user token is normally verified would
+authenticate the human, not `lore-server`, and would let any user who can
+reach `RepositoryCreate` call `CreateResource` directly with that same
+token. This determines how the server-to-sidecar hop must actually be
+authenticated: not by treating the forwarded token as absent, and not by
+verifying it as a user credential, but by gating this hop with its own
+service credential (a shared secret or mTLS) that stands apart from
+whatever the caller happens to forward.
 
 **Implementation status (security review remediation pass, after PHASE
 1a):** RESOLVED on this project's own side, with an honest caveat about the
@@ -131,17 +147,34 @@ at both the unit level (`grpc.rs`'s `tests` module, `db: None`) and end to
 end against a real Postgres-backed service
 (`tests/postgres_backed.rs`'s `rebac_*_against_real_db` tests).
 
-The caveat: the pinned/unmodified upstream `lore-server` binary confirmed
-above to send no authorization header on this hop also has no config
-surface to send `REBAC_SERVICE_TOKEN` specifically -- that is a fact about
-`lore-server`, not something this project's remediation could change
-without modifying a different repository (`epic-lore`), which is out of
-scope here. So: anything that can reach the gRPC port WITHOUT the secret is
-now denied (the vulnerability this closes), but making the REAL
-`lore-server` present that secret in a live deployment requires an
-operator-controlled piece on the network path (a sidecar/proxy that injects
-the header) -- see `docs/configuration.md`'s `REBAC_SERVICE_TOKEN` section
-for the full writeup of this boundary.
+The caveat: by default, the pinned/unmodified upstream `lore-server` binary
+confirmed above to forward the end user's own bearer token on this hop --
+not a service credential -- also has no config surface to send
+`REBAC_SERVICE_TOKEN` specifically. That is a fact about `lore-server`, not
+something this project's remediation could change without modifying a
+different repository (`epic-lore`), which is out of scope here. So:
+anything that can reach the gRPC port WITHOUT the secret is now denied (the
+vulnerability this closes), but making the REAL `lore-server` present that
+secret in a live deployment requires either the patch described in
+"Resolution" below, or an operator-controlled piece on the network path (a
+sidecar/proxy that injects the header) -- see `docs/configuration.md`'s
+`REBAC_SERVICE_TOKEN` section for the full writeup of this boundary.
+
+**Resolution (on `lore-server`'s side, not yet upstream):** an optional
+`[server.auth] rebac_service_token` setting exists as a not-yet-upstreamed
+patch on the `epic-lore` repository's `feat/rebac-service-token` branch
+(commit `4185ed4`, based on upstream commit
+`f205899adf24b13b2d28e5c08d9256ac99c69f0c`; `epic-lore` is `lore-server`'s
+own, separate repository, not part of this project). When configured, it
+makes `lore-server`'s rebac client replace the forwarded caller token with
+`authorization: Bearer <token>` on this hop only; when absent, behavior is
+unchanged from the paragraph above. Proven end to end on 2026-08-06: the
+correct token lets `RepositoryCreate` succeed and creates a row in this
+service's `resources` table; a wrong token is rejected; leaving the
+setting unset leaves behavior unchanged. Deployments running a stock,
+unpatched `lore-server` binary are still affected and still need an
+operator-controlled piece on the network path to attach a real service
+credential.
 
 ## Q7. Expected `permission` string vocabulary
 
@@ -181,20 +214,37 @@ reading the caching code, not from a running test.
 
 ## Q12. Does `lore-server` need its own service identity to call this sidecar?
 
-Related to Q6. If `lore-server` never sends a bearer token on `RebacApi`
-calls, it may need some other credential (mTLS client cert, shared secret)
-to be trusted at all.
+Related to Q6. `lore-server` DOES send a bearer token on `RebacApi`
+calls -- the end user's own, forwarded verbatim by
+`create_request_with_authorization` -- so this was never a question of
+whether a credential exists. It is whether that user credential should
+also stand in for `lore-server`'s own identity, and it should not: a user
+token authenticates the human who triggered the repository create/delete,
+not the `lore-server` process, and treating it as sufficient would let any
+user who can reach `RepositoryCreate` call `CreateResource` directly with
+that same token. So the real question is whether `lore-server` needs some
+other credential -- one that identifies `lore-server` itself, distinct
+from whichever user happened to trigger the call -- to be trusted on this
+hop.
 
 **Decided (security review remediation pass):** yes, a shared secret
 (`REBAC_SERVICE_TOKEN`), not mTLS -- see Q6 for the full decision writeup.
-mTLS was considered and rejected for this pass: the pinned `lore-server`'s
-own TLS config for this hop (`ClientTlsConfig::new().with_native_roots()`
-in `lore-server/src/authnz/rebac.rs`) only verifies THIS service's server
+mTLS was considered and rejected for this pass, and that reasoning holds
+independently of the bearer-token question above: the pinned
+`lore-server`'s own TLS config for this hop
+(`ClientTlsConfig::new().with_native_roots()` in
+`lore-server/src/authnz/rebac.rs`) only verifies THIS service's server
 certificate; it configures no client identity/certificate of its own, so
 there is nothing for real mTLS (mutual auth) to check on `lore-server`'s
 side without a change to that other repository. A shared secret is the
 mechanism that can actually be enforced entirely on this project's own
 side of the hop today.
+
+This is now corroborated, not just argued: the actual fix on
+`lore-server`'s side (see Q6's "Resolution" note) also takes the
+shared-secret/bearer-token route -- swapping the forwarded caller token for
+a configured one -- rather than adding a client certificate. Both sides of
+the hop converged on the same kind of mechanism independently.
 
 ## Q13. Where does `ExchangeUserTokenForMultiresourceToken` get `idp` from? (SETTLED)
 

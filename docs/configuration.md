@@ -190,22 +190,51 @@ mechanism and full reasoning.
 Why a shared secret and not the same bearer-JWT check
 `crates/lore-authz-server/src/caller.rs` uses for `LookupUserPermissions`/
 `CheckUserPermission`: `lore-server` is the caller on this hop, not an end
-user, and reading the pinned fork's actual client code
-(`lore-server/src/authnz/rebac.rs`'s `RebacClientHelper`) confirms it
-attaches no bearer token, and no client TLS identity, to these calls --
-only a correlation-id interceptor for tracing. There is nothing for a
-JWT-verification check to verify here; a shared secret matches what the
-design plan itself recommends for this hop (mTLS or a shared secret, not a
-user token) and is the smaller, more auditable surface of the two.
+user, and it has no `principals` row of its own to resolve to. Reading the
+pinned fork's actual client code (`lore-server/src/authnz/rebac.rs`'s
+`RebacClientHelper`) shows it builds its gRPC channel with only a
+`CorrelationInterceptor` (tracing correlation id) -- but the call sites
+that use that channel (`repository_create_auth_resource` /
+`repository_delete_auth_resource`) build their requests through
+`create_request_with_authorization`, so what actually arrives on this hop
+is the END USER's own bearer token, forwarded verbatim. That is a real,
+verifiable credential, just the wrong KIND: verifying it the way
+`caller.rs` does would authenticate the human, not `lore-server`, and would
+let any user who can reach `RepositoryCreate` call `CreateResource`
+directly with that same token. A shared secret matches what the design
+plan itself recommends for this hop (mTLS or a shared secret, not a user
+token) and is the smaller, more auditable surface of the two.
 
-**The honest gap**: the pinned/unmodified upstream `lore-server` binary this
-project integrates against does not send `REBAC_SERVICE_TOKEN` (or any
-credential) on this hop today, because it has no config surface to do so.
-Setting this variable is therefore a real deployment requirement, not a
-config flip you do in isolation: something on the network path between
-`lore-server` and this service's gRPC port has to attach the header --
-typically a sidecar or reverse proxy the operator controls, since
-`lore-server`'s own `auth_url` does not have to point directly at this
-service's raw listener. Making `lore-server` itself send this header is a
-change to a different repository (`epic-lore`), out of scope for this
-project. See `docs/open-questions.md` Q6 for the full writeup.
+**The honest gap**: by default, the pinned/unmodified upstream
+`lore-server` binary this project integrates against forwards the end
+user's own bearer token on this hop rather than a service credential, and
+has no config surface to send `REBAC_SERVICE_TOKEN` (or any other
+service-specific credential) instead. Setting this variable on THIS
+service is therefore a real deployment requirement, not a config flip you
+do in isolation: something has to replace the forwarded caller token with
+the shared secret before it reaches this service's gRPC port.
+
+An optional `[server.auth] rebac_service_token` setting closes that gap on
+`lore-server`'s own side. It exists as a not-yet-upstreamed patch on the
+`epic-lore` repository's `feat/rebac-service-token` branch (commit
+`4185ed4`, based on upstream commit
+`f205899adf24b13b2d28e5c08d9256ac99c69f0c`; `epic-lore` is `lore-server`'s
+own, separate repository, not part of this project). When configured, it
+makes `lore-server`'s rebac client replace the forwarded caller token with
+`authorization: Bearer <token>` on this hop only, matching whatever value
+you also set for `REBAC_SERVICE_TOKEN` here; when absent, `lore-server`
+keeps forwarding the caller's own token as described above. Proven end to
+end on 2026-08-06: the correct token lets `RepositoryCreate` succeed and
+creates a row in this service's `resources` table; a wrong token is
+rejected; leaving the setting unset leaves behavior unchanged
+(non-breaking).
+
+Deployments running a stock, unpatched `lore-server` binary are still
+affected: they have no config surface to send a service credential at all,
+so the caller's own token still lands here, and something else on the
+network path -- e.g. a sidecar or reverse proxy the operator controls --
+is still needed to attach a real header before `REBAC_SERVICE_TOKEN` here
+does anything for them. Making `lore-server` itself send this header
+without the patch above is a change to a different repository
+(`epic-lore`), out of scope for this project. See
+`docs/open-questions.md` Q6 for the full writeup.

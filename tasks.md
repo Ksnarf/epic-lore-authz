@@ -1041,6 +1041,17 @@ including the literal wildcard sentinel `urc-*`.
       `lore-server` never sends. A shared secret matches the design plan's
       own recommendation (`docs/open-questions.md` Q6/Q12, now resolved on
       this project's side) and is enforceable entirely within this repo.
+      [correction, 2026-08-06]: the line above conflated the gRPC channel's
+      own interceptors (correlation id only, no bearer token, no client TLS
+      identity -- true of the CHANNEL) with what the call sites send on it.
+      `repository_create_auth_resource` / `repository_delete_auth_resource`
+      build their requests through `create_request_with_authorization`, so a
+      real bearer token -- the END USER's own, forwarded verbatim -- DOES
+      arrive on this hop. The gap this gate closes is the credential's KIND
+      (a user token, not a service one), not its absence. See
+      `crates/lore-authz-server/src/service_auth.rs` and
+      `docs/open-questions.md` Q6 for the corrected writeup. The decision
+      itself (shared secret, not a JWT check) is unaffected.
       `RebacApiService::authorize_caller` (`grpc.rs`) runs BEFORE
       `require_db`, so an unauthenticated caller learns nothing about this
       service's Postgres configuration state.
