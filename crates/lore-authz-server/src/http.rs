@@ -266,3 +266,187 @@ async fn unimplemented() -> (StatusCode, &'static str) {
         "not implemented in this scaffold - see tasks.md for the owning phase",
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use uuid::Uuid;
+
+    use super::*;
+    use crate::login;
+    use crate::login::LoginSettings;
+    use crate::oidc::OidcConfig;
+    use crate::signing::SigningKeyStore;
+
+    fn signing_keys() -> Arc<SigningKeyStore> {
+        Arc::new(
+            SigningKeyStore::load("file:///epic-lore-authz-http-test-fixture-does-not-exist.der")
+                .unwrap(),
+        )
+    }
+
+    fn unconfigured_state() -> AppState {
+        AppState {
+            signing_keys: signing_keys(),
+            db: None,
+            oidc: None,
+            oidc_login: OidcLoginSettings::default(),
+        }
+    }
+
+    /// Security review finding: both browser routes' "login is not
+    /// configured" denial (`db` or `oidc` unset) was `[code-says]` -- read
+    /// but never actually executed by a test. Both fail toward denial
+    /// (503), never toward anything resembling success, and the underlying
+    /// logic is already covered at the unit/gRPC level (see tasks.md); this
+    /// is the smoke test over the HTTP surface itself.
+    #[tokio::test]
+    async fn login_page_denies_when_not_configured() {
+        let response = login_page(
+            State(unconfigured_state()),
+            Path("any-login-code".to_string()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn oidc_callback_denies_when_not_configured() {
+        let response = oidc_callback(
+            State(unconfigured_state()),
+            Query(CallbackQuery {
+                code: Some("any-code".to_string()),
+                state: Some("any-state".to_string()),
+                error: None,
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// A fresh, throwaway SQLite database -- no Docker/Postgres/Dex needed
+    /// for this file's tests, unlike `tests/oidc_flow.rs`.
+    async fn fresh_sqlite_db() -> Db {
+        let path = std::env::temp_dir().join(format!(
+            "epic-lore-authz-http-test-{}.sqlite3",
+            Uuid::new_v4()
+        ));
+        let database_url = format!("sqlite://{}", path.display());
+        Db::connect(&database_url, "loreauth")
+            .await
+            .expect("connect + migrate a fresh throwaway sqlite file")
+    }
+
+    /// Security review finding: the `ProviderUnavailable` page (502) was
+    /// `[code-says]` -- the test IdP is always up, so nothing ever drove
+    /// this branch for real. Here the identity provider genuinely is
+    /// unreachable (port 0 never accepts a connection), so this exercises
+    /// the REAL path: `login_page` -> `oidc_login::authorize_redirect` ->
+    /// `OidcProvider::authorization_url` -> `discovery()` actually failing.
+    /// Asserts the response is `provider_unavailable_page` (502), never a
+    /// success and never indistinguishable from `invalid_login_page` (400).
+    #[tokio::test]
+    async fn login_page_renders_provider_unavailable_when_the_idp_is_unreachable() {
+        let db = fresh_sqlite_db().await;
+        let provider = OidcProvider::new(OidcConfig {
+            issuer: "http://127.0.0.1:0".to_string(),
+            client_id: "client".to_string(),
+            client_secret: "secret".to_string(),
+            redirect_url: "https://authz.example.com/oidc/callback".to_string(),
+            scopes: "openid".to_string(),
+        })
+        .unwrap();
+
+        let settings = LoginSettings {
+            public_base_url: "https://authz.example.com".to_string(),
+            ..LoginSettings::default()
+        };
+        let started = login::start_session(
+            &db,
+            &settings,
+            "client-state",
+            "the-oidc-state".to_string(),
+            "the-oidc-nonce".to_string(),
+            "the-pkce-verifier".to_string(),
+        )
+        .await
+        .expect("start a pending login session");
+        let login_code = started
+            .login_url
+            .rsplit('/')
+            .next()
+            .expect("login_url must end with the login_code")
+            .to_string();
+
+        let state = AppState {
+            signing_keys: signing_keys(),
+            db: Some(Arc::new(db)),
+            oidc: Some(Arc::new(provider)),
+            oidc_login: OidcLoginSettings::default(),
+        };
+
+        let response = login_page(State(state), Path(login_code)).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_GATEWAY,
+            "an unreachable identity provider must render provider_unavailable_page, not a \
+             success and not invalid_login_page"
+        );
+    }
+
+    /// Same real-unreachable-provider shape, through the OTHER browser
+    /// route: the identity provider redirects back with a code, but the
+    /// token-endpoint exchange itself cannot reach the provider. Built with
+    /// `login::start_session` directly (rather than `oidc_login::start`) so
+    /// the `oidc_state` this test presents back is known upfront.
+    #[tokio::test]
+    async fn oidc_callback_renders_provider_unavailable_when_the_idp_is_unreachable() {
+        let db = fresh_sqlite_db().await;
+        let provider = OidcProvider::new(OidcConfig {
+            issuer: "http://127.0.0.1:0".to_string(),
+            client_id: "client".to_string(),
+            client_secret: "secret".to_string(),
+            redirect_url: "https://authz.example.com/oidc/callback".to_string(),
+            scopes: "openid".to_string(),
+        })
+        .unwrap();
+
+        let settings = LoginSettings {
+            public_base_url: "https://authz.example.com".to_string(),
+            ..LoginSettings::default()
+        };
+        login::start_session(
+            &db,
+            &settings,
+            "client-state",
+            "the-oidc-state".to_string(),
+            "the-oidc-nonce".to_string(),
+            "the-pkce-verifier".to_string(),
+        )
+        .await
+        .expect("start a pending login session");
+
+        let state = AppState {
+            signing_keys: signing_keys(),
+            db: Some(Arc::new(db)),
+            oidc: Some(Arc::new(provider)),
+            oidc_login: OidcLoginSettings::default(),
+        };
+
+        let response = oidc_callback(
+            State(state),
+            Query(CallbackQuery {
+                code: Some("some-authorization-code".to_string()),
+                state: Some("the-oidc-state".to_string()),
+                error: None,
+            }),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_GATEWAY,
+            "an unreachable identity provider must render provider_unavailable_page"
+        );
+    }
+}

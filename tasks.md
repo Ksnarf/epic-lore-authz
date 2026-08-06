@@ -445,13 +445,16 @@ integration test has actually been run and its output logged.
       `an_id_token_signed_by_a_key_the_provider_does_not_publish_is_rejected`,
       `a_real_id_token_with_the_wrong_nonce_is_rejected`.
 - [~] Test coverage gaps, stated rather than papered over:
-      - **Unconfigured-provider denial is proven at the RPC and unit level**
+      - **Unconfigured-provider denial is now `[verified-e2e]` through the
+        HTTP routes too**, not just at the RPC and unit level. Previously
+        proven at the RPC/unit level only
         (`start_auth_session_without_a_provider_denies_against_real_db`,
         `grpc::tests::start_auth_session_without_a_configured_provider_
-        fails_closed`, and `oidc::tests::a_partially_configured_provider_is_
-        refused_at_construction`), but NOT through the HTTP routes -- the
-        browser routes' `login_not_configured_page` path is `[code-says]`,
-        read but not executed by a test.
+        fails_closed`, `oidc::tests::a_partially_configured_provider_is_
+        refused_at_construction`); the browser routes' `login_not_
+        configured_page` path is now actually executed by
+        `http::tests::login_page_denies_when_not_configured` and
+        `http::tests::oidc_callback_denies_when_not_configured`.
       - **The issuer-mismatch refusal in discovery is now `[verified-e2e]`**:
         the earlier claim here (that it would need a second, deliberately-
         misconfigured *provider*) was wrong -- it only needs a discovery
@@ -459,8 +462,17 @@ integration test has actually been run and its output logged.
         which a trivial in-process mock HTTP server produces with no real
         IdP involved. See `oidc::tests::
         a_discovery_document_whose_issuer_disagrees_with_its_url_is_refused`.
-      - The `ProviderUnavailable` pages are `[code-says]` for the same
-        reason (the test IdP is always up).
+      - **The `ProviderUnavailable` pages are now `[verified-e2e]`**: rather
+        than a second real IdP (disproportionate for what is fundamentally
+        "the HTTP call to the provider fails"), both browser routes are
+        pointed at `http://127.0.0.1:0` -- a port nothing can ever accept a
+        connection on -- which drives a REAL connection failure through
+        `discovery()`/`exchange_code()`, not a mocked outcome. See
+        `http::tests::login_page_renders_provider_unavailable_when_the_idp_
+        is_unreachable` and `http::tests::oidc_callback_renders_provider_
+        unavailable_when_the_idp_is_unreachable`. Needs no Docker/Postgres/
+        Dex: these four new `http::tests` run against a throwaway SQLite
+        file, same as any other unit test.
 
 **Left open / explicitly out of scope for this pass**: SAML and SCIM
 (untouched by instruction), group-claim mapping, key rotation, `audit_log`,
