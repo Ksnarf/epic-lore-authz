@@ -82,6 +82,23 @@ pub struct Principal {
     pub preferred_username: String,
     pub is_service_account: bool,
     pub status: PrincipalStatus,
+    /// The `idp` claim value to stamp on AuthZ tokens minted for this
+    /// principal, recorded by whichever identity provider proved their
+    /// identity (PHASE 1b).
+    ///
+    /// This field is how `ExchangeUserTokenForMultiresourceToken` answers
+    /// docs/open-questions.md Q13: `idp` is MANDATORY on lore-server's
+    /// `AuthorizationToken` shape and omitting it fails SILENTLY (the token
+    /// decodes as the AuthN shape instead and `resources` becomes `None` --
+    /// docs/protocol-notes.md #7b), but the AuthN token the exchange
+    /// receives has no `idp` field to recover it from. So it is recovered
+    /// from here instead.
+    ///
+    /// `None` for principals provisioned without an identity provider (the
+    /// Phase 1a manual/test path); the token minter falls back to the
+    /// configured `TOKEN_IDP` in that case, never to an empty or absent
+    /// claim.
+    pub idp: Option<String>,
 }
 
 /// Same `external_id` / `source` / `status` rationale as `Principal` above --

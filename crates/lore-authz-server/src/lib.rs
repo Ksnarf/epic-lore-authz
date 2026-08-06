@@ -9,6 +9,8 @@ pub mod config;
 pub mod db;
 pub mod grpc;
 pub mod http;
+pub mod login;
 pub mod minting;
+pub mod secret;
 pub mod service_auth;
 pub mod signing;

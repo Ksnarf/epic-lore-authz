@@ -127,3 +127,81 @@ async fn rebac_create_resource_rejects_wildcard_sentinel_against_real_db() {
 async fn migrations_are_idempotent() {
     authz_suite::migrations_are_idempotent(Backend::Postgres).await
 }
+
+// --- PHASE 1b: login sessions and the AuthZ token exchange ---------------
+// Same one-line-wrapper rule as above: every body lives exactly once, in
+// `authz_suite`, and BOTH backends call all of them.
+
+#[tokio::test]
+async fn poll_returns_an_authn_token_once_the_browser_leg_completes() {
+    authz_suite::poll_returns_an_authn_token_once_the_browser_leg_completes(Backend::Postgres).await
+}
+
+#[tokio::test]
+async fn poll_is_single_use_and_never_reissues() {
+    authz_suite::poll_is_single_use_and_never_reissues(Backend::Postgres).await
+}
+
+#[tokio::test]
+async fn poll_with_an_unknown_session_code_is_indistinguishable_from_pending() {
+    authz_suite::poll_with_an_unknown_session_code_is_indistinguishable_from_pending(
+        Backend::Postgres,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn poll_with_a_mismatched_client_state_never_issues_a_token() {
+    authz_suite::poll_with_a_mismatched_client_state_never_issues_a_token(Backend::Postgres).await
+}
+
+#[tokio::test]
+async fn expired_sessions_are_denied_at_both_transitions() {
+    authz_suite::expired_sessions_are_denied_at_both_transitions(Backend::Postgres).await
+}
+
+#[tokio::test]
+async fn poll_denies_when_the_session_principal_is_not_active() {
+    authz_suite::poll_denies_when_the_session_principal_is_not_active(Backend::Postgres).await
+}
+
+#[tokio::test]
+async fn starting_a_session_without_a_public_base_url_fails_closed() {
+    authz_suite::starting_a_session_without_a_public_base_url_fails_closed(Backend::Postgres).await
+}
+
+#[tokio::test]
+async fn starting_a_session_reaps_expired_ones() {
+    authz_suite::starting_a_session_reaps_expired_ones(Backend::Postgres).await
+}
+
+#[tokio::test]
+async fn exchange_mints_an_authz_token_with_resources_idp_and_env() {
+    authz_suite::exchange_mints_an_authz_token_with_resources_idp_and_env(Backend::Postgres).await
+}
+
+#[tokio::test]
+async fn exchange_falls_back_to_the_configured_idp_when_the_principal_has_none() {
+    authz_suite::exchange_falls_back_to_the_configured_idp_when_the_principal_has_none(
+        Backend::Postgres,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn exchange_omits_resources_the_caller_has_no_grant_for() {
+    authz_suite::exchange_omits_resources_the_caller_has_no_grant_for(Backend::Postgres).await
+}
+
+#[tokio::test]
+async fn exchange_for_a_caller_with_no_grants_yields_an_empty_resources_claim() {
+    authz_suite::exchange_for_a_caller_with_no_grants_yields_an_empty_resources_claim(
+        Backend::Postgres,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn exchange_denies_every_unauthenticated_caller() {
+    authz_suite::exchange_denies_every_unauthenticated_caller(Backend::Postgres).await
+}

@@ -18,6 +18,9 @@ Every value in `.env.example` is a placeholder. Never commit a real `.env`
 | `TOKEN_ENV` | no | `dev` | Value placed in the `env` claim of every minted token. Required by lore-server on both claim shapes -- see `docs/protocol-notes.md` section 2. |
 | `AUTHN_TOKEN_TTL_SECS` | no | `36000` (10h) | AuthN token lifetime. |
 | `AUTHZ_TOKEN_TTL_SECS` | no | `3600` (1h) | AuthZ token lifetime. Keep short: see the stateless-revocation-window note in `docs/protocol-notes.md`. |
+| `TOKEN_IDP` | no | `local` | `idp` claim fallback for principals with no recorded identity provider (`Principal.idp` unset -- the manual/test provisioning path). **Must not be empty**, and the process refuses to start if it is: an AuthZ token with an empty or absent `idp` is ACCEPTED by lore-server and then silently stripped of its `resources` claim, surfacing as a permissions bug rather than a claims error. See `docs/protocol-notes.md` section 2 and `docs/open-questions.md` Q13. Principals provisioned through OIDC record their own `idp` and ignore this. |
+| `AUTH_SESSION_TTL_SECS` | no | `300` (5m) | How long a browser login session (`StartAuthSession` -> `GetAuthSession`) stays usable. Deliberately longer than the lore CLI's own hard 150-second polling budget -- see the "The 150-second client login deadline" section below. |
+| `PUBLIC_BASE_URL` | **yes for login** | (none) | Origin this service is reachable at IN A BROWSER (scheme + host + optional port, no path), e.g. `https://authz.example.com`. `StartAuthSession` builds the `login_url` it hands the CLI as `<PUBLIC_BASE_URL>/login/<login_code>`. **Unset means `StartAuthSession` denies with `Status::failed_precondition`** rather than issuing a login URL that goes nowhere; a warning is logged at startup. If unset, this falls back to the origin of `OIDC_REDIRECT_URL`, which is usually the same host. |
 | `SIGNING_KEY_SOURCE` | no | `file:///CHANGE_ME/signing-key.der` | Phase 0: a `file://` unencrypted PKCS#8 EC P-256 private key, PEM or raw DER (NOT a JWK -- see `crates/lore-authz-server/src/signing.rs`). If the file does not exist, an ephemeral dev key is generated in memory and a warning is logged. Phase 1+: real key management. |
 | `JWKS_PATH` | no | `/.well-known/jwks.json` | Path on the HTTP listener to serve this service's own JWKS on. |
 | `REBAC_SERVICE_TOKEN` | **yes, effectively** | (none) | Shared secret gating `RebacApi::CreateResource`/`DeleteResource` (security review remediation -- see `docs/open-questions.md` Q6). Present as `authorization: Bearer <value>` on those two RPCs only; unrelated to `JWT_ISSUER`/`JWT_AUDIENCE` and not a JWT. **Unset means both RPCs deny every caller** with `Status::unauthenticated` (`crates/lore-authz-server/src/service_auth.rs`) -- a deliberate fail-closed default, not a bug. See the dedicated section below for the honest gap this does and does not close. |
@@ -80,6 +83,39 @@ setting it in any real deployment: the lore CLI validates `aud` against the
 lore SERVER's own domain **client-side**, independently of whatever
 `lore-server`'s own `auth.jwt_audience` config accepts. The simplest correct
 configuration sets both to the lore server's root domain.
+
+## The 150-second client login deadline (a client-side limit, documented not worked around)
+
+The lore CLI polls `GetAuthSession` every 5 seconds up to 30 times and then
+gives up with a timeout. That is a hard **150-second budget for the entire
+browser login**, set in the CLI's own source, and nothing this service can
+configure extends it.
+
+Enterprise MFA can exceed it. A push notification to a phone in another
+room, a hardware-token PIN prompt, or a first-time IdP consent screen can
+all take longer than two and a half minutes.
+
+What happens when it is exceeded, and why it is survivable:
+
+- The CLI gives up and reports a timeout.
+- `AUTH_SESSION_TTL_SECS` (default **300**, deliberately double the CLI's
+  budget) means the session is still alive, so the user who finishes MFA at
+  the three-minute mark still lands on a success page rather than a
+  confusing error.
+- They re-run the login. The second attempt is fast, because the IdP session
+  is now established and the IdP redirects straight through.
+
+Why it is not "fixed" server-side: the only levers would be to hold the poll
+open (long-polling, which `GetAuthSessionResponse`'s request/response shape
+does not support) or to report progress this service does not have. Neither
+is available, and pretending otherwise would be worse than documenting the
+limit. Operators running IdPs with slow interactive MFA should expect the
+occasional "run `lore auth login` twice" and can raise
+`AUTH_SESSION_TTL_SECS` to make the second attempt reliably land.
+
+Do not lower `AUTH_SESSION_TTL_SECS` below ~180: a session that expires
+INSIDE the CLI's own polling window turns a slow login into a silent
+failure, which is the one outcome worse than a timeout.
 
 ## `REBAC_SERVICE_TOKEN`: what it closes, and what it honestly does not
 

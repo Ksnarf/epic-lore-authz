@@ -99,6 +99,26 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    // PHASE 1b (see tasks.md): token/session knobs for the login and
+    // exchange RPCs. `public_base_url` being empty is a real, denied state,
+    // not a benign default -- StartAuthSession refuses to issue a login URL
+    // it cannot construct, so say so at startup rather than at the first
+    // login attempt.
+    let login_settings = lore_authz_server::login::LoginSettings {
+        token_env: config.token_env.clone(),
+        authn_token_ttl_secs: config.authn_token_ttl_secs,
+        authz_token_ttl_secs: config.authz_token_ttl_secs,
+        session_ttl_secs: config.auth_session_ttl_secs,
+        public_base_url: config.public_base_url.clone(),
+        default_idp: config.token_idp.clone(),
+    };
+    if login_settings.public_base_url.is_empty() {
+        warn!(
+            "PUBLIC_BASE_URL is not set: StartAuthSession will deny with FailedPrecondition \
+             because it cannot build a browser login URL -- see docs/configuration.md"
+        );
+    }
+
     info!(
         grpc = %config.grpc_listen_addr,
         http = %config.http_listen_addr,
@@ -122,6 +142,7 @@ async fn main() -> anyhow::Result<()> {
             signing_keys: signing_keys.clone(),
             jwt_issuer: config.jwt_issuer.clone(),
             jwt_audience: config.jwt_audience.clone(),
+            login: login_settings.clone(),
         }))
         .add_service(RebacApiServer::new(RebacApiService {
             db: db.clone(),

@@ -51,6 +51,7 @@ pub mod groups;
 pub mod permissions;
 pub mod principals;
 pub mod resources;
+pub mod sessions;
 
 /// Only plain SQL identifiers are accepted for `DB_SCHEMA` (Postgres only --
 /// see the module doc comment). It is operator-controlled, not attacker

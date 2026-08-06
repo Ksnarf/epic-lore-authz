@@ -24,6 +24,11 @@ use crate::db::permissions::DbPolicyStore;
 use crate::db::permissions::WILDCARD_RESOURCE_PATTERN;
 use crate::db::principals;
 use crate::db::resources;
+use crate::login;
+use crate::login::LoginSettings;
+use crate::login::PollOutcome;
+use crate::minting::AuthzTokenInput;
+use crate::minting::mint_authz_token;
 use crate::service_auth;
 use crate::signing::SigningKeyStore;
 
@@ -59,6 +64,9 @@ pub struct AuthApiService {
     pub signing_keys: Arc<SigningKeyStore>,
     pub jwt_issuer: String,
     pub jwt_audience: Vec<String>,
+    /// Token/session knobs for the PHASE 1b login and exchange RPCs -- see
+    /// `crate::login::LoginSettings`.
+    pub login: LoginSettings,
 }
 
 impl AuthApiService {
@@ -123,14 +131,52 @@ impl epic_urc::urc_auth_api_server::UrcAuthApi for AuthApiService {
         ))
     }
 
-    // P0, Phase 1b (deliberately untouched by PHASE 1a -- see tasks.md).
+    // PHASE 1b (see tasks.md). The CLI polls this every 5 seconds while the
+    // operator completes the browser login, up to 30 times, then gives up
+    // (its own hard 150-second budget -- see `crate::login`'s module doc
+    // comment for why this service does not try to work around it).
+    //
+    // `Ok(user_token: None)` means "keep polling", and is deliberately the
+    // response for EVERY not-yet-a-token outcome, including an unknown or
+    // expired session_code and a mismatched client_state -- this endpoint is
+    // unauthenticated, so distinguishing them would make it an oracle. The
+    // one exception is a real database failure, which returns an error
+    // rather than inviting 29 more pointless polls. See `crate::login`.
     async fn get_auth_session(
         &self,
-        _request: Request<epic_urc::GetAuthSessionRequest>,
+        request: Request<epic_urc::GetAuthSessionRequest>,
     ) -> Result<Response<epic_urc::GetAuthSessionResponse>, Status> {
-        Err(Status::unimplemented(
-            "get_auth_session: Phase 1b (see tasks.md)",
-        ))
+        let db = self.require_db()?.clone();
+        let req = request.into_inner();
+
+        let outcome = login::poll_session(
+            &db,
+            &self.signing_keys,
+            &self.login,
+            &self.jwt_issuer,
+            &self.jwt_audience,
+            &req.session_code,
+            &req.client_state,
+        )
+        .await?;
+
+        let user_token = match outcome {
+            PollOutcome::KeepPolling => None,
+            PollOutcome::Authenticated(user) => Some(epic_urc::UserToken {
+                user_token: user.token.token,
+                // MILLISECONDS, not seconds -- a different unit from the
+                // JWT's own `exp` claim inside the same token. See
+                // docs/open-questions.md Q1 (SETTLED) and
+                // `crate::minting::signed_token`.
+                expires_at: user.token.expires_at,
+                user_id: user.user_id,
+                user_name: user.user_name,
+            }),
+        };
+
+        Ok(Response::new(epic_urc::GetAuthSessionResponse {
+            user_token,
+        }))
     }
 
     // Dead upstream: RefreshAuthSessionRequest carries no refresh token and
@@ -177,16 +223,96 @@ impl epic_urc::urc_auth_api_server::UrcAuthApi for AuthApiService {
         ))
     }
 
-    // P0, Phase 1b (deliberately untouched by PHASE 1a -- see tasks.md). THE
-    // core RPC that will mint the AuthZ token carrying `resources`; the
-    // policy engine it will read (`PgPolicyStore`, below) already exists as
-    // of PHASE 1a.
+    // PHASE 1b (see tasks.md). THE core RPC: takes the caller's AuthN token
+    // as `authorization: Bearer <token>` and mints the AuthZ token carrying
+    // the `resources` claim that lore-server actually enforces.
+    //
+    // Three details that are load-bearing rather than incidental:
+    //
+    //  * `idp` is recovered from the PRINCIPAL ROW, not from the caller's
+    //    AuthN token -- that token has no `idp` field at all
+    //    (docs/protocol-notes.md #7b, docs/open-questions.md Q13, now
+    //    settled). Omitting it would not fail loudly: lore-server would
+    //    silently decode the token as the AuthN shape, drop `resources` to
+    //    `None`, and every repository operation would fail as a misleading
+    //    permissions error.
+    //  * `resources` contains ONLY the requested ids the caller actually
+    //    holds a grant for. A requested id with no grant, or one that was
+    //    never registered / has been deleted, is simply absent -- so a
+    //    caller entitled to nothing gets a well-formed token that authorizes
+    //    nothing, rather than an error that might be retried into a
+    //    different answer.
+    //  * A wildcard grant is expanded to concrete resource ids by the shared
+    //    policy engine, never emitted as the literal `"urc-*"` (see
+    //    `crate::db::permissions`).
     async fn exchange_user_token_for_multiresource_token(
         &self,
-        _request: Request<epic_urc::ExchangeUserTokenForMultiresourceTokenRequest>,
+        request: Request<epic_urc::ExchangeUserTokenForMultiresourceTokenRequest>,
     ) -> Result<Response<epic_urc::ExchangeUserTokenForMultiresourceTokenResponse>, Status> {
-        Err(Status::unimplemented(
-            "exchange_user_token_for_multiresource_token: Phase 1b (see tasks.md)",
+        let db = self.require_db()?.clone();
+        let authorization = authorization_header(&request);
+        let req = request.into_inner();
+
+        let principal = self
+            .resolve_caller(&db, authorization.as_deref(), None)
+            .await?;
+
+        let policy = DbPolicyStore::new(db.clone());
+        let granted = policy
+            .resolve_resource_permissions(&principal, &req.resource_id)
+            .await
+            .map_err(|err| {
+                tracing::warn!(?err, "resolve_resource_permissions failed");
+                Status::internal("permission resolution failed")
+            })?;
+
+        // Never empty (see LoginSettings::default_idp): an empty `idp` is as
+        // silently broken as an absent one.
+        let idp = principal
+            .idp
+            .clone()
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| self.login.default_idp.clone());
+
+        let signed = mint_authz_token(
+            self.signing_keys.active(),
+            &self.jwt_issuer,
+            &self.jwt_audience,
+            &self.login.token_env,
+            self.login.authz_token_ttl_secs,
+            &AuthzTokenInput {
+                user_id: principal.id.to_string(),
+                name: principal.display_name.clone(),
+                preferred_username: principal.preferred_username.clone(),
+                is_service_account: principal.is_service_account,
+                idp,
+                // Group-claim-to-`groups` mapping is a separate, still-open
+                // Phase 1 item (tasks.md); emitting a half-mapped list here
+                // would be worse than emitting none.
+                groups: None,
+                resources: granted,
+            },
+        )
+        .map_err(|err| {
+            tracing::warn!(error = %err, "minting an AuthZ token failed");
+            Status::internal("token minting failed")
+        })?;
+
+        tracing::info!(
+            principal_id = %principal.id,
+            requested = req.resource_id.len(),
+            "AuthZ token issued"
+        );
+
+        Ok(Response::new(
+            epic_urc::ExchangeUserTokenForMultiresourceTokenResponse {
+                token: Some(epic_urc::UserToken {
+                    user_token: signed.token,
+                    expires_at: signed.expires_at,
+                    user_id: principal.id.to_string(),
+                    user_name: principal.display_name,
+                }),
+            },
         ))
     }
 
@@ -514,6 +640,7 @@ mod tests {
             ),
             jwt_issuer: "https://authz.example.com".to_string(),
             jwt_audience: vec!["lore.example.com".to_string()],
+            login: LoginSettings::default(),
         }
     }
 
@@ -548,6 +675,65 @@ mod tests {
             epic_urc::urc_auth_api_server::UrcAuthApi::check_user_permission(&service, request)
                 .await
                 .expect_err("must fail closed, not panic or allow, when Postgres is unconfigured");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+    }
+
+    /// PHASE 1b. The same fail-closed shape for the two login RPCs backed by
+    /// session storage: with no database configured they must deny, never
+    /// fall back to some in-memory path that would silently work on one
+    /// replica and not another.
+    #[tokio::test]
+    async fn get_auth_session_without_configured_database_fails_closed() {
+        let service = service_without_db();
+        let request = Request::new(epic_urc::GetAuthSessionRequest {
+            session_code: "anything".to_string(),
+            client_state: "anything".to_string(),
+        });
+
+        let err = epic_urc::urc_auth_api_server::UrcAuthApi::get_auth_session(&service, request)
+            .await
+            .expect_err("must fail closed when the database is unconfigured");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn exchange_user_token_without_configured_database_fails_closed() {
+        let service = service_without_db();
+        let request = Request::new(epic_urc::ExchangeUserTokenForMultiresourceTokenRequest {
+            resource_id: vec!["urc-abc".to_string()],
+        });
+
+        let err =
+            epic_urc::urc_auth_api_server::UrcAuthApi::exchange_user_token_for_multiresource_token(
+                &service, request,
+            )
+            .await
+            .expect_err("must fail closed when the database is unconfigured");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+    }
+
+    /// The exchange RPC must never mint a token for a caller who presented
+    /// no bearer token at all. Checked here at the unit level (the
+    /// `require_db` early return runs first, so this uses a service WITH a
+    /// database in the real-database suite too -- see
+    /// `tests/authz_suite`'s `exchange_*` cases).
+    #[tokio::test]
+    async fn exchange_user_token_with_no_bearer_is_denied_before_any_token_is_minted() {
+        let service = service_without_db();
+        let request = Request::new(epic_urc::ExchangeUserTokenForMultiresourceTokenRequest {
+            resource_id: vec![],
+        });
+
+        let err =
+            epic_urc::urc_auth_api_server::UrcAuthApi::exchange_user_token_for_multiresource_token(
+                &service, request,
+            )
+            .await
+            .expect_err("no bearer token must never produce a token");
+        // FailedPrecondition (no DB) rather than Unauthenticated here, and
+        // that ordering is deliberate: an unconfigured service tells an
+        // anonymous caller nothing about its auth state. Either way the
+        // invariant this asserts holds -- no error path produces a token.
         assert_eq!(err.code(), Code::FailedPrecondition);
     }
 

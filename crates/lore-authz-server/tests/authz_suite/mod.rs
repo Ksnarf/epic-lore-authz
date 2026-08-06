@@ -94,6 +94,50 @@
 //! - `migrations_are_idempotent`: re-running a backend's embedded
 //!   migrations against an already-migrated database is a no-op, not an
 //!   error.
+//!
+//! ## PHASE 1b cases (login sessions and the AuthZ token exchange)
+//! - `poll_returns_an_authn_token_once_the_browser_leg_completes`: the happy
+//!   path for everything either side of the identity provider -- a session
+//!   is started through the real `login::start_session`, the browser leg
+//!   completes through the same `db::sessions::mark_authenticated` the OIDC
+//!   callback calls, and the next `GetAuthSession` returns a
+//!   signature-verifiable AuthN token. Also asserts `UserToken.expires_at`
+//!   is MILLISECONDS and equals the JWT's own seconds-valued `exp` times
+//!   1000 (docs/open-questions.md Q1), and that the browser login URL does
+//!   not contain the polling secret.
+//! - `poll_is_single_use_and_never_reissues`: a replayed `session_code`
+//!   never mints a second token.
+//! - `poll_with_an_unknown_session_code_is_indistinguishable_from_pending`:
+//!   this endpoint is unauthenticated, so an unknown (or empty) code must
+//!   produce exactly the same response as a pending one -- no oracle.
+//! - `poll_with_a_mismatched_client_state_never_issues_a_token`: the
+//!   `session_code` alone is not enough, and a failed attempt does not
+//!   consume the session out from under its rightful owner.
+//! - `expired_sessions_are_denied_at_both_transitions`: an expired session
+//!   can be neither authenticated by the callback nor redeemed by a poll.
+//! - `poll_denies_when_the_session_principal_is_not_active`: identity is
+//!   re-checked at mint time, not trusted from the session row.
+//! - `starting_a_session_without_a_public_base_url_fails_closed` and
+//!   `starting_a_session_reaps_expired_ones`: `StartAuthSession` denies
+//!   rather than emitting a login URL it cannot build, refuses an empty
+//!   `client_state`, and reaps expired rows so the table cannot grow without
+//!   bound.
+//! - `exchange_mints_an_authz_token_with_resources_idp_and_env`: THE
+//!   high-value one -- the exchanged token carries `resources`, a non-empty
+//!   `idp` recovered from the PRINCIPAL ROW (the AuthN token it was handed
+//!   has no such claim), and `env`. Missing `env` fails loudly at
+//!   lore-server; missing `idp` fails silently and looks like a permissions
+//!   bug (docs/protocol-notes.md section 2).
+//! - `exchange_falls_back_to_the_configured_idp_when_the_principal_has_none`:
+//!   an empty `idp` is as broken as an absent one, so there is a fallback
+//!   and it is never empty. Also re-proves wildcard expansion.
+//! - `exchange_omits_resources_the_caller_has_no_grant_for` and
+//!   `exchange_for_a_caller_with_no_grants_yields_an_empty_resources_claim`:
+//!   the exchange never widens access, and a caller entitled to nothing gets
+//!   a well-formed token that authorizes nothing.
+//! - `exchange_denies_every_unauthenticated_caller`: no bearer token, a
+//!   garbage bearer token, and a validly-signed token for a principal that
+//!   does not exist all deny before anything is minted.
 
 use std::sync::Arc;
 
@@ -107,17 +151,38 @@ use lore_authz_server::db::permissions::ROLE_ADMIN;
 use lore_authz_server::db::permissions::ROLE_READER;
 use lore_authz_server::db::permissions::ROLE_WRITER;
 use lore_authz_server::db::permissions::grant;
+use lore_authz_server::db::principals::ExternalIdentity;
+use lore_authz_server::db::principals::insert_external_principal;
 use lore_authz_server::db::principals::insert_principal;
+use lore_authz_server::db::sessions;
 use lore_authz_server::grpc::AuthApiService;
 use lore_authz_server::grpc::RebacApiService;
+use lore_authz_server::login;
+use lore_authz_server::login::LoginSettings;
+use lore_authz_server::minting::AuthnTokenInput;
 use lore_authz_server::minting::AuthzTokenInput;
+use lore_authz_server::minting::mint_authn_token;
 use lore_authz_server::minting::mint_authz_token;
+use lore_authz_server::secret::random_url_safe_token;
 use lore_authz_server::signing::SigningKeyStore;
 use tonic::Code;
 use tonic::Request;
 use uuid::Uuid;
 
 const ISSUER: &str = "https://authz.example.com";
+
+/// `env` claim on every token these tests mint or assert on. Non-negotiable
+/// on both claim shapes -- see docs/protocol-notes.md section 2.
+const TOKEN_ENV: &str = "test";
+
+/// `idp` fallback for principals with no recorded identity provider. Used
+/// to prove the exchange RPC never emits an empty `idp` even for a
+/// principal that never went through an IdP.
+const DEFAULT_IDP: &str = "test-default-idp";
+
+/// Browser-facing origin these tests configure. Only its SHAPE matters here
+/// (that `login_url` is built from it); nothing dials it.
+const PUBLIC_BASE_URL: &str = "https://authz.example.com";
 
 /// Shared secret gating `RebacApi` in these tests -- see
 /// `crates/lore-authz-server/src/service_auth.rs` and
@@ -187,6 +252,19 @@ async fn fresh_db(backend: Backend) -> Db {
     }
 }
 
+/// The base login/token settings every harness uses. `session_ttl_secs` is
+/// overridden per test where expiry is the thing under test.
+fn login_settings() -> LoginSettings {
+    LoginSettings {
+        token_env: TOKEN_ENV.to_string(),
+        authn_token_ttl_secs: 36_000,
+        authz_token_ttl_secs: 3_600,
+        session_ttl_secs: 300,
+        public_base_url: PUBLIC_BASE_URL.to_string(),
+        default_idp: DEFAULT_IDP.to_string(),
+    }
+}
+
 struct Harness {
     db: Arc<Db>,
     auth_service: AuthApiService,
@@ -205,6 +283,7 @@ impl Harness {
             signing_keys,
             jwt_issuer: ISSUER.to_string(),
             jwt_audience: audience(),
+            login: login_settings(),
         };
         let rebac_service = RebacApiService {
             db: Some(db.clone()),
@@ -278,10 +357,123 @@ impl Harness {
             .expect("create_resource");
     }
 
+    /// Mints an AuthN token (identity only, NO `resources` and NO `idp`) and
+    /// wraps it as a `Bearer` request -- the exact shape the lore CLI
+    /// presents to `ExchangeUserTokenForMultiresourceToken`. Distinct from
+    /// `request_with_bearer` above, which mints an AuthZ token: the exchange
+    /// RPC is specifically the hop where the caller has only the AuthN
+    /// token, which is why it cannot read `idp` off the token it is handed
+    /// (docs/protocol-notes.md #7b).
+    fn request_with_authn_bearer<T>(
+        &self,
+        body: T,
+        user_id: Uuid,
+        display_name: &str,
+    ) -> Request<T> {
+        let token = mint_authn_token(
+            self.auth_service.signing_keys.active(),
+            ISSUER,
+            &audience(),
+            TOKEN_ENV,
+            3600,
+            &AuthnTokenInput {
+                user_id: user_id.to_string(),
+                name: display_name.to_string(),
+                preferred_username: display_name.to_string(),
+                is_service_account: false,
+            },
+        )
+        .expect("mint AuthN test token")
+        .token;
+        let mut req = Request::new(body);
+        req.metadata_mut()
+            .insert("authorization", format!("Bearer {token}").parse().unwrap());
+        req
+    }
+
+    /// Starts a real login session through the production code path
+    /// (`login::start_session`), returning what the CLI would get plus the
+    /// OIDC `state` the browser leg will present -- which in production is
+    /// generated by `crate::oidc_login` and handed to the same function.
+    async fn start_login(&self, client_state: &str) -> StartedTestSession {
+        self.start_login_with_ttl(client_state, 300).await
+    }
+
+    async fn start_login_with_ttl(
+        &self,
+        client_state: &str,
+        session_ttl_secs: u64,
+    ) -> StartedTestSession {
+        let oidc_state = random_url_safe_token().expect("csprng");
+        let settings = LoginSettings {
+            session_ttl_secs,
+            ..login_settings()
+        };
+        let started = login::start_session(
+            &self.db,
+            &settings,
+            client_state,
+            oidc_state.clone(),
+            random_url_safe_token().expect("csprng"),
+            random_url_safe_token().expect("csprng"),
+        )
+        .await
+        .expect("start_session");
+        StartedTestSession {
+            session_code: started.session_code,
+            login_url: started.login_url,
+            oidc_state,
+        }
+    }
+
+    /// Completes the browser leg the way the real OIDC callback does --
+    /// through `db::sessions::mark_authenticated`, the same function
+    /// `crate::oidc_login` calls once it has verified an ID token. Returns
+    /// whether the transition actually happened.
+    async fn complete_login(&self, oidc_state: &str, principal_id: Uuid) -> bool {
+        sessions::mark_authenticated(&self.db, oidc_state, principal_id, login::now_ms())
+            .await
+            .expect("mark_authenticated")
+    }
+
+    /// Polls exactly as the CLI does, through the real gRPC handler.
+    async fn poll(&self, session_code: &str, client_state: &str) -> Option<epic_urc::UserToken> {
+        self.auth_service
+            .get_auth_session(Request::new(epic_urc::GetAuthSessionRequest {
+                session_code: session_code.to_string(),
+                client_state: client_state.to_string(),
+            }))
+            .await
+            .expect("get_auth_session must not error on any keep-polling path")
+            .into_inner()
+            .user_token
+    }
+
     async fn create_user(&self, id: Uuid, name: &str) {
         insert_principal(&self.db, id, name, false)
             .await
             .expect("insert_principal (user)");
+    }
+
+    /// A principal provisioned the way the OIDC login leg provisions one,
+    /// with a recorded `idp` -- so the exchange RPC's "recover `idp` from
+    /// the principal row" path can be tested for real rather than only its
+    /// fallback.
+    async fn create_oidc_user(&self, id: Uuid, name: &str, subject: &str, idp: &str) {
+        insert_external_principal(
+            &self.db,
+            id,
+            &ExternalIdentity {
+                subject: subject.to_string(),
+                source: "oidc".to_string(),
+                idp: idp.to_string(),
+                display_name: name.to_string(),
+                preferred_username: name.to_string(),
+                email: None,
+            },
+        )
+        .await
+        .expect("insert_external_principal");
     }
 
     async fn create_service_account(&self, id: Uuid, name: &str) {
@@ -327,9 +519,46 @@ impl Harness {
     }
 }
 
+/// What `Harness::start_login` hands back: the CLI-facing pair plus the OIDC
+/// `state` that the browser leg needs (and that a test playing the attacker
+/// must NOT be able to guess).
+struct StartedTestSession {
+    session_code: String,
+    login_url: String,
+    oidc_state: String,
+}
+
 fn sorted(mut v: Vec<String>) -> Vec<String> {
     v.sort();
     v
+}
+
+/// Decodes a token this suite's own signing key produced, verifying the
+/// SIGNATURE, issuer and audience for real -- these assertions are about
+/// what a relying party would accept, so decoding without verification would
+/// prove nothing.
+fn decode_authz_claims(
+    h: &Harness,
+    token: &str,
+) -> jsonwebtoken::TokenData<lore_authz_core::claims::AuthzClaims> {
+    let key = jsonwebtoken::DecodingKey::from_jwk(&h.auth_service.signing_keys.active().public_jwk)
+        .expect("our own public JWK");
+    let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::ES256);
+    validation.set_issuer(&[ISSUER]);
+    validation.set_audience(&audience());
+    jsonwebtoken::decode(token, &key, &validation).expect("minted AuthZ token must verify")
+}
+
+fn decode_authn_claims(
+    h: &Harness,
+    token: &str,
+) -> jsonwebtoken::TokenData<lore_authz_core::claims::AuthnClaims> {
+    let key = jsonwebtoken::DecodingKey::from_jwk(&h.auth_service.signing_keys.active().public_jwk)
+        .expect("our own public JWK");
+    let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::ES256);
+    validation.set_issuer(&[ISSUER]);
+    validation.set_audience(&audience());
+    jsonwebtoken::decode(token, &key, &validation).expect("minted AuthN token must verify")
 }
 
 pub async fn wildcard_grant_allows_any_registered_resource(backend: Backend) {
@@ -907,6 +1136,453 @@ pub async fn rebac_create_resource_rejects_wildcard_sentinel_against_real_db(bac
         .await
         .expect_err("the literal wildcard sentinel must never be creatable as a real resource");
     assert_eq!(err.code(), Code::InvalidArgument);
+}
+
+// --- PHASE 1b: login sessions (StartAuthSession / GetAuthSession) --------
+
+/// The happy path for the half of the login flow that does not involve an
+/// identity provider: a session is started, the browser leg completes, and
+/// the very next poll returns a REAL, signature-verifiable AuthN token whose
+/// claims are the ones lore's own client-side decoder requires.
+pub async fn poll_returns_an_authn_token_once_the_browser_leg_completes(backend: Backend) {
+    let h = Harness::new(backend).await;
+    let user = Uuid::new_v4();
+    h.create_user(user, "Session User").await;
+
+    let client_state = "client-state-happy-path";
+    let started = h.start_login(client_state).await;
+
+    // Before the browser leg: keep polling, with no token.
+    assert!(
+        h.poll(&started.session_code, client_state).await.is_none(),
+        "a pending session must never hand out a token"
+    );
+    // The login URL is built from PUBLIC_BASE_URL and carries a code that is
+    // NOT the polling secret -- a leaked login URL must not let its holder
+    // poll for the resulting token.
+    assert!(started.login_url.starts_with(PUBLIC_BASE_URL));
+    assert!(
+        !started.login_url.contains(&started.session_code),
+        "the session_code must never appear in the browser login URL"
+    );
+
+    assert!(h.complete_login(&started.oidc_state, user).await);
+
+    let token = h
+        .poll(&started.session_code, client_state)
+        .await
+        .expect("an authenticated session must issue a token on the next poll");
+
+    assert_eq!(token.user_id, user.to_string());
+    assert_eq!(token.user_name, "Session User");
+    // MILLISECONDS on the wire, not seconds -- docs/open-questions.md Q1.
+    // A seconds value would be ~1.7e9; a milliseconds value ~1.7e12.
+    assert!(
+        token.expires_at > 1_000_000_000_000,
+        "UserToken.expires_at must be epoch milliseconds, not seconds"
+    );
+
+    let claims = decode_authn_claims(&h, &token.user_token).claims;
+    assert_eq!(claims.user_id, user.to_string());
+    assert_eq!(claims.env, TOKEN_ENV, "`env` is mandatory on both shapes");
+    assert_eq!(claims.name, "Session User");
+    // The JWT `exp` claim is SECONDS and is a different value from
+    // UserToken.expires_at above; assert the relationship rather than
+    // trusting they happen to agree.
+    assert_eq!(token.expires_at, claims.expires_at as i64 * 1000);
+    // An AuthN token carries no `resources` at all -- proven structurally by
+    // AuthnClaims having no such field, and on the wire by lore_compat.rs.
+}
+
+/// A session_code is SINGLE USE. The CLI polls every 5 seconds, so a replay
+/// window here would mean a captured code keeps minting fresh tokens for as
+/// long as the session lives.
+pub async fn poll_is_single_use_and_never_reissues(backend: Backend) {
+    let h = Harness::new(backend).await;
+    let user = Uuid::new_v4();
+    h.create_user(user, "Replay User").await;
+
+    let client_state = "client-state-single-use";
+    let started = h.start_login(client_state).await;
+    assert!(h.complete_login(&started.oidc_state, user).await);
+
+    assert!(
+        h.poll(&started.session_code, client_state).await.is_some(),
+        "the first poll after authentication must issue a token"
+    );
+    assert!(
+        h.poll(&started.session_code, client_state).await.is_none(),
+        "a REUSED session_code must never issue a second token"
+    );
+    assert!(
+        h.poll(&started.session_code, client_state).await.is_none(),
+        "and must keep refusing, not merely refuse once"
+    );
+}
+
+/// An unknown session_code must be indistinguishable from a pending one: no
+/// error, no distinct status, no token. Otherwise this unauthenticated
+/// endpoint becomes an oracle for enumerating live sessions.
+pub async fn poll_with_an_unknown_session_code_is_indistinguishable_from_pending(backend: Backend) {
+    let h = Harness::new(backend).await;
+    let client_state = "client-state-unknown";
+
+    // A real, pending session, for the response we are comparing against.
+    let started = h.start_login(client_state).await;
+    let pending = h.poll(&started.session_code, client_state).await;
+
+    let unknown = h
+        .poll("this-session-code-was-never-issued", client_state)
+        .await;
+    let empty = h.poll("", client_state).await;
+
+    assert!(pending.is_none());
+    assert!(
+        unknown.is_none(),
+        "an unknown code must not error or reveal itself"
+    );
+    assert!(empty.is_none(), "an empty code must be treated as unknown");
+}
+
+/// The session_code alone must not be enough: the poll must also present the
+/// client_state the CLI generated at StartAuthSession. This is what stops a
+/// session_code observed in isolation from being redeemable.
+pub async fn poll_with_a_mismatched_client_state_never_issues_a_token(backend: Backend) {
+    let h = Harness::new(backend).await;
+    let user = Uuid::new_v4();
+    h.create_user(user, "State User").await;
+
+    let started = h.start_login("the-real-client-state").await;
+    assert!(h.complete_login(&started.oidc_state, user).await);
+
+    assert!(
+        h.poll(&started.session_code, "a-different-client-state")
+            .await
+            .is_none(),
+        "a wrong client_state must never redeem a session"
+    );
+    assert!(
+        h.poll(&started.session_code, "").await.is_none(),
+        "an empty client_state must never redeem a session"
+    );
+    // ... and the session is still intact for its rightful owner, i.e. the
+    // failed attempts did not consume it.
+    assert!(
+        h.poll(&started.session_code, "the-real-client-state")
+            .await
+            .is_some()
+    );
+}
+
+/// Expiry is enforced at BOTH transitions, not just one: an expired session
+/// cannot be authenticated, and an authenticated session that then expires
+/// cannot be redeemed.
+pub async fn expired_sessions_are_denied_at_both_transitions(backend: Backend) {
+    let h = Harness::new(backend).await;
+    let user = Uuid::new_v4();
+    h.create_user(user, "Expiry User").await;
+
+    // Already expired the moment it exists (ttl 0).
+    let dead = h.start_login_with_ttl("client-state-dead", 0).await;
+    assert!(
+        !h.complete_login(&dead.oidc_state, user).await,
+        "an expired session must not be authenticatable by the IdP callback"
+    );
+    assert!(
+        h.poll(&dead.session_code, "client-state-dead")
+            .await
+            .is_none()
+    );
+
+    // Authenticated first, expires afterwards -- the case a slow user hits.
+    let live = h.start_login_with_ttl("client-state-live", 1).await;
+    assert!(h.complete_login(&live.oidc_state, user).await);
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+    assert!(
+        h.poll(&live.session_code, "client-state-live")
+            .await
+            .is_none(),
+        "an authenticated session that has since expired must not issue a token"
+    );
+}
+
+/// A session whose principal is deprovisioned (or never existed) between the
+/// browser callback and the poll must not produce a token -- the identity is
+/// re-checked at mint time, not trusted from the session row.
+pub async fn poll_denies_when_the_session_principal_is_not_active(backend: Backend) {
+    let h = Harness::new(backend).await;
+    // A principal id that resolves to no `principals` row at all.
+    let ghost = Uuid::new_v4();
+
+    let client_state = "client-state-ghost";
+    let started = h.start_login(client_state).await;
+    assert!(h.complete_login(&started.oidc_state, ghost).await);
+
+    assert!(
+        h.poll(&started.session_code, client_state).await.is_none(),
+        "a session bound to a non-active principal must never issue a token"
+    );
+}
+
+/// `StartAuthSession` cannot issue a login URL it has no origin for, and
+/// must say so rather than emit a broken one.
+pub async fn starting_a_session_without_a_public_base_url_fails_closed(backend: Backend) {
+    let h = Harness::new(backend).await;
+    let settings = LoginSettings {
+        public_base_url: String::new(),
+        ..login_settings()
+    };
+    let err = login::start_session(
+        &h.db,
+        &settings,
+        "client-state",
+        random_url_safe_token().unwrap(),
+        random_url_safe_token().unwrap(),
+        random_url_safe_token().unwrap(),
+    )
+    .await
+    .expect_err("no public base URL must deny, not emit a broken login URL");
+    assert_eq!(err.code(), Code::FailedPrecondition);
+
+    // An empty client_state is refused for the same reason: it is half of
+    // what a poll must present, so accepting it would make the resulting
+    // session redeemable by anyone holding only the session_code.
+    let err = login::start_session(
+        &h.db,
+        &login_settings(),
+        "   ",
+        random_url_safe_token().unwrap(),
+        random_url_safe_token().unwrap(),
+        random_url_safe_token().unwrap(),
+    )
+    .await
+    .expect_err("an empty client_state must be refused");
+    assert_eq!(err.code(), Code::InvalidArgument);
+}
+
+/// The opportunistic reaper actually removes expired rows, so the session
+/// table does not grow without bound in a long-lived deployment.
+pub async fn starting_a_session_reaps_expired_ones(backend: Backend) {
+    let h = Harness::new(backend).await;
+    let expired = h.start_login_with_ttl("client-state-reap", 0).await;
+
+    // Present before the reaper runs...
+    assert!(
+        sessions::find_by_session_code_hash(
+            &h.db,
+            &lore_authz_server::secret::sha256_b64url(&expired.session_code),
+        )
+        .await
+        .expect("lookup")
+        .is_some()
+    );
+
+    // ... and gone after the next StartAuthSession, which reaps first.
+    let _ = h.start_login("client-state-reap-2").await;
+    assert!(
+        sessions::find_by_session_code_hash(
+            &h.db,
+            &lore_authz_server::secret::sha256_b64url(&expired.session_code),
+        )
+        .await
+        .expect("lookup")
+        .is_none(),
+        "an expired session must be reaped by the next StartAuthSession"
+    );
+}
+
+// --- PHASE 1b: ExchangeUserTokenForMultiresourceToken --------------------
+
+/// The single highest-value assertion in this file: exchanging an AuthN
+/// token yields an AuthZ token that carries `resources`, `idp` AND `env`.
+/// Missing `env` fails loudly at lore-server; missing `idp` fails SILENTLY,
+/// dropping `resources` and surfacing as a permissions bug (see
+/// docs/protocol-notes.md section 2).
+pub async fn exchange_mints_an_authz_token_with_resources_idp_and_env(backend: Backend) {
+    let h = Harness::new(backend).await;
+    let user = Uuid::new_v4();
+    h.create_oidc_user(user, "Exchange User", "idp-subject-1", "example-idp")
+        .await;
+    h.create_resource("urc-exchange1").await;
+    h.grant_specific(ROLE_WRITER, "urc-exchange1", "user", user)
+        .await;
+
+    let resp = h
+        .auth_service
+        .exchange_user_token_for_multiresource_token(h.request_with_authn_bearer(
+            epic_urc::ExchangeUserTokenForMultiresourceTokenRequest {
+                resource_id: vec!["urc-exchange1".to_string()],
+            },
+            user,
+            "Exchange User",
+        ))
+        .await
+        .expect("exchange")
+        .into_inner();
+
+    let token = resp
+        .token
+        .expect("the exchange response must carry a token");
+    assert_eq!(token.user_id, user.to_string());
+    assert!(token.expires_at > 1_000_000_000_000, "milliseconds");
+
+    let claims = decode_authz_claims(&h, &token.user_token).claims;
+    assert_eq!(
+        claims.idp, "example-idp",
+        "`idp` must come from the principal row -- the AuthN token has no such claim"
+    );
+    assert_eq!(claims.env, TOKEN_ENV);
+    let resources = claims.resources.expect("`resources` must be present");
+    assert_eq!(resources.len(), 1);
+    assert_eq!(resources[0].resource_id, "urc-exchange1");
+    assert_eq!(
+        sorted(resources[0].permission.clone()),
+        vec!["read".to_string(), "write".to_string()]
+    );
+}
+
+/// A principal with no recorded identity provider still gets a NON-EMPTY
+/// `idp`, from the configured fallback. An empty `idp` is as silently broken
+/// as an absent one.
+pub async fn exchange_falls_back_to_the_configured_idp_when_the_principal_has_none(
+    backend: Backend,
+) {
+    let h = Harness::new(backend).await;
+    let user = Uuid::new_v4();
+    h.create_user(user, "Local User").await; // no idp recorded
+    h.create_resource("urc-exchange2").await;
+    h.grant_wildcard(ROLE_READER, "user", user).await;
+
+    let resp = h
+        .auth_service
+        .exchange_user_token_for_multiresource_token(h.request_with_authn_bearer(
+            epic_urc::ExchangeUserTokenForMultiresourceTokenRequest {
+                resource_id: vec!["urc-exchange2".to_string()],
+            },
+            user,
+            "Local User",
+        ))
+        .await
+        .expect("exchange")
+        .into_inner();
+
+    let claims = decode_authz_claims(&h, &resp.token.unwrap().user_token).claims;
+    assert_eq!(claims.idp, DEFAULT_IDP);
+    assert!(!claims.idp.is_empty());
+    // A wildcard grant must be EXPANDED to concrete ids, never emitted as
+    // the literal sentinel -- see db/permissions.rs's module doc comment.
+    let resources = claims.resources.expect("resources");
+    assert_eq!(resources.len(), 1);
+    assert_eq!(resources[0].resource_id, "urc-exchange2");
+}
+
+/// The exchange must not smuggle in access the caller does not have: an
+/// ungranted resource, a never-registered one, and a deleted one are all
+/// simply absent from `resources`.
+pub async fn exchange_omits_resources_the_caller_has_no_grant_for(backend: Backend) {
+    let h = Harness::new(backend).await;
+    let user = Uuid::new_v4();
+    h.create_user(user, "Scoped User").await;
+    h.create_resource("urc-granted").await;
+    h.create_resource("urc-notgranted").await;
+    h.grant_specific(ROLE_READER, "urc-granted", "user", user)
+        .await;
+
+    let resp = h
+        .auth_service
+        .exchange_user_token_for_multiresource_token(h.request_with_authn_bearer(
+            epic_urc::ExchangeUserTokenForMultiresourceTokenRequest {
+                resource_id: vec![
+                    "urc-granted".to_string(),
+                    "urc-notgranted".to_string(),
+                    "urc-neverexisted".to_string(),
+                ],
+            },
+            user,
+            "Scoped User",
+        ))
+        .await
+        .expect("exchange")
+        .into_inner();
+
+    let claims = decode_authz_claims(&h, &resp.token.unwrap().user_token).claims;
+    let ids: Vec<String> = claims
+        .resources
+        .expect("resources")
+        .into_iter()
+        .map(|r| r.resource_id)
+        .collect();
+    assert_eq!(ids, vec!["urc-granted".to_string()]);
+}
+
+/// A caller entitled to nothing gets a well-formed token that authorizes
+/// nothing -- not an error, and never a token with someone else's access.
+pub async fn exchange_for_a_caller_with_no_grants_yields_an_empty_resources_claim(
+    backend: Backend,
+) {
+    let h = Harness::new(backend).await;
+    let user = Uuid::new_v4();
+    h.create_user(user, "Ungranted User").await;
+    h.create_resource("urc-somebodyelses").await;
+
+    let resp = h
+        .auth_service
+        .exchange_user_token_for_multiresource_token(h.request_with_authn_bearer(
+            epic_urc::ExchangeUserTokenForMultiresourceTokenRequest {
+                resource_id: vec!["urc-somebodyelses".to_string()],
+            },
+            user,
+            "Ungranted User",
+        ))
+        .await
+        .expect("exchange")
+        .into_inner();
+
+    let claims = decode_authz_claims(&h, &resp.token.unwrap().user_token).claims;
+    assert_eq!(claims.resources.expect("resources").len(), 0);
+}
+
+/// Every unauthenticated route into the exchange must deny, and must deny
+/// BEFORE anything is minted: no bearer token, a garbage bearer token, and a
+/// correctly-signed token for a principal that does not exist.
+pub async fn exchange_denies_every_unauthenticated_caller(backend: Backend) {
+    let h = Harness::new(backend).await;
+
+    let body = || epic_urc::ExchangeUserTokenForMultiresourceTokenRequest {
+        resource_id: vec!["urc-anything".to_string()],
+    };
+
+    let err = h
+        .auth_service
+        .exchange_user_token_for_multiresource_token(Request::new(body()))
+        .await
+        .expect_err("no bearer token must deny");
+    assert_eq!(err.code(), Code::Unauthenticated);
+
+    let mut garbage = Request::new(body());
+    garbage
+        .metadata_mut()
+        .insert("authorization", "Bearer not-a-jwt".parse().unwrap());
+    let err = h
+        .auth_service
+        .exchange_user_token_for_multiresource_token(garbage)
+        .await
+        .expect_err("an unparseable bearer token must deny");
+    assert_eq!(err.code(), Code::Unauthenticated);
+
+    // Correctly signed by us, unexpired, right issuer and audience -- but
+    // its `sub` resolves to no principal.
+    let ghost = Uuid::new_v4();
+    let err = h
+        .auth_service
+        .exchange_user_token_for_multiresource_token(h.request_with_authn_bearer(
+            body(),
+            ghost,
+            "Ghost",
+        ))
+        .await
+        .expect_err("a valid token for an unknown principal must deny");
+    assert_eq!(err.code(), Code::Unauthenticated);
 }
 
 pub async fn migrations_are_idempotent(backend: Backend) {

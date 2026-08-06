@@ -56,6 +56,8 @@
 
 use tonic::Status;
 
+use crate::secret::constant_time_eq;
+
 /// Strips a leading `"Bearer "` prefix, matching `crate::caller::
 /// strip_bearer`'s convention, and treats an empty string as "no token
 /// present" for the same reason documented there (lore-server's own
@@ -99,31 +101,6 @@ pub fn verify_rebac_caller(
     } else {
         Err(Status::unauthenticated("invalid service token"))
     }
-}
-
-/// Constant-time byte comparison: length is checked up front (not secret --
-/// leaking it does not help an attacker guess the token), then every byte
-/// pair is compared with no early exit, so a byte-by-byte early-return
-/// comparison (`==` on `&str`/`&[u8]`, which DOES short-circuit) cannot leak
-/// how many leading bytes of the secret an attacker has guessed correctly
-/// via a timing side channel.
-///
-/// This project already pins `ring` (see workspace `Cargo.toml`) and `ring`
-/// does expose `constant_time::verify_slices_are_equal`, but that function
-/// is `#[deprecated]` as of the pinned version ("Internal function not
-/// intended for external use with no promises regarding side channels") --
-/// using it would both fail `cargo clippy -D warnings` and rely on an API
-/// its own docs say not to depend on. A small hand-rolled XOR-accumulate
-/// comparison is the standard, dependency-free way to do this instead.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff: u8 = 0;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
 }
 
 #[cfg(test)]

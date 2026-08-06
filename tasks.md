@@ -223,6 +223,106 @@ integration test has actually been run and its output logged.
       root-domain handling and `UserToken.expires_at`) on the strength of
       this run.
 
+## PHASE 1b, part 1 - auth session store, GetAuthSession, token exchange (2026-08-05)
+
+- [x] `auth_sessions` table and storage layer, both backends.
+      [verified-e2e] `crates/lore-authz-server/migrations/
+      0002_auth_sessions.sql` + `migrations_sqlite/0002_auth_sessions.sql`
+      (kept in step; the SQLite file documents each forced difference), and
+      `crates/lore-authz-server/src/db/sessions.rs`. Sessions live in the
+      DATABASE, not process memory, because the three legs of one login (CLI
+      start, browser login + IdP callback, CLI poll) can each land on a
+      different replica behind a load balancer -- an in-memory map would
+      fail intermittently rather than loudly. Timestamps are epoch
+      MILLISECONDS as plain integers on both backends, so the expiry logic
+      has one code path, not two.
+      Per-column hashed-vs-raw decision, documented in the migration itself:
+      `session_code_hash` / `login_code_hash` / `client_state_hash` are
+      SHA-256 fingerprints (they are only ever compared, so a database read
+      yields no usable polling credential); `oidc_state` / `oidc_nonce` /
+      `pkce_verifier` are raw because the login leg must REPRODUCE them (two
+      go into the authorization-request URL, one is sent to the IdP's token
+      endpoint) and a hash cannot do that.
+- [x] Session codes cryptographically random, single-use, and expiring.
+      [verified-e2e] `crates/lore-authz-server/src/secret.rs`:
+      `random_url_safe_token` is 32 bytes from `ring`'s `SystemRandom`
+      rendered as 43 base64url chars, and FAILS rather than degrading if the
+      system CSPRNG is unavailable. Single-use is enforced by the DATABASE,
+      not by a Rust check that could be raced: `db::sessions::consume` is a
+      conditional `UPDATE ... WHERE status = 'authenticated' AND
+      expires_at_ms > ?` and a token is minted only when it reports
+      `rows_affected == 1`. Expiry is in the SQL of every state-changing
+      statement, not only in Rust.
+      TWO separate secrets, not one: the `session_code` the CLI polls with
+      never appears in the browser login URL (which carries its own
+      `login_code`), so a leaked login URL does not let its holder collect
+      the resulting token. Asserted by
+      `poll_returns_an_authn_token_once_the_browser_leg_completes`.
+- [x] `GetAuthSession` (real logic). [verified-e2e]
+      `crates/lore-authz-server/src/login.rs`'s `poll_session`, wired in
+      `grpc.rs`. Returns the AuthN token exactly once, on the first poll
+      after the browser leg completes.
+      NO POLLING ORACLE: unknown session_code, empty session_code, expired
+      session, mismatched `client_state`, still-pending session, already
+      consumed session, and a session whose principal has since been
+      deprovisioned ALL return the identical `Ok(user_token: None)` ("keep
+      polling") response, and all of the first four cost exactly one
+      database round trip. The single exception is a real database failure,
+      which returns `Err` rather than inviting 29 more pointless polls.
+      Honest limit stated in the module doc comment: this equalizes the
+      RESPONSE and the round-trip count, it does not claim constant-time
+      behaviour against a determined timing attacker (the code is 256 bits
+      of CSPRNG entropy, so there is nothing useful to narrow down).
+      `client_state` is compared as a constant-time hash comparison, never
+      in plaintext.
+- [x] `ExchangeUserTokenForMultiresourceToken` (real logic). [verified-e2e]
+      `grpc.rs`. Verifies the caller's AuthN bearer token
+      (`crate::caller`), resolves the effective grants through the SAME
+      `DbPolicyStore` engine `CheckUserPermission`/`LookupUserPermissions`
+      use (so a wildcard grant is expanded to concrete ids, never emitted as
+      the literal `"urc-*"`), and mints the AuthZ token.
+      **Settles `docs/open-questions.md` Q13** (`idp` at exchange time): it
+      is recovered from the new `principals.idp` column, NOT from the
+      caller's AuthN token, which has no such claim. A missing `idp` fails
+      SILENTLY at lore-server (the token decodes as the AuthN shape and
+      `resources` drops to `None`), so `LoginSettings::default_idp` /
+      `TOKEN_IDP` guarantees a non-empty fallback for principals with none,
+      and `Config::from_env` refuses to start if `TOKEN_IDP` is empty.
+      A caller entitled to nothing gets a well-formed token whose
+      `resources` is empty -- never an error, never someone else's access.
+- [x] 13 new tests, run against BOTH backends (26 test executions), all
+      passing. [verified-e2e] Added to the SHARED `tests/authz_suite/mod.rs`
+      so Postgres and SQLite cannot drift: `poll_returns_an_authn_token_
+      once_the_browser_leg_completes`, `poll_is_single_use_and_never_
+      reissues`, `poll_with_an_unknown_session_code_is_indistinguishable_
+      from_pending`, `poll_with_a_mismatched_client_state_never_issues_a_
+      token`, `expired_sessions_are_denied_at_both_transitions`,
+      `poll_denies_when_the_session_principal_is_not_active`,
+      `starting_a_session_without_a_public_base_url_fails_closed`,
+      `starting_a_session_reaps_expired_ones`,
+      `exchange_mints_an_authz_token_with_resources_idp_and_env`,
+      `exchange_falls_back_to_the_configured_idp_when_the_principal_has_
+      none`, `exchange_omits_resources_the_caller_has_no_grant_for`,
+      `exchange_for_a_caller_with_no_grants_yields_an_empty_resources_
+      claim`, `exchange_denies_every_unauthenticated_caller`. Plus 4 new
+      `grpc::tests` unit cases for the DB-unconfigured fail-closed paths.
+      The token assertions decode with real SIGNATURE + issuer + audience
+      verification, not an insecure decode, and assert `UserToken.expires_at
+      == exp * 1000` (proving the two units are handled as two units, per
+      `docs/open-questions.md` Q1).
+- [x] Constant-time comparison de-duplicated into
+      `crates/lore-authz-server/src/secret.rs` and shared by
+      `service_auth.rs` and `login.rs`. [code-says] a security primitive
+      with two copies is one that gets fixed once.
+- [~] Config surface for the above: `TOKEN_IDP`, `AUTH_SESSION_TTL_SECS`,
+      `PUBLIC_BASE_URL`. Documented in `docs/configuration.md` (including a
+      dedicated section on the CLI's 150-second login deadline).
+      **`.env.example` NOT updated**: the tooling this pass ran under blocks
+      all writes to `.env*` paths, including this committed
+      placeholders-only template. Nothing was worked around. Whoever picks
+      this up next should add the three variables above to `.env.example`
+      from the `docs/configuration.md` table.
+
 ## Phase 1 - Real IdP, persistence, service accounts
 
 - [ ] Postgres, sqlx migrations, schema-qualified DDL, `DB_SCHEMA` config
