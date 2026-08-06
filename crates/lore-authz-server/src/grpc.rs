@@ -20,7 +20,7 @@ use tonic::Status;
 
 use crate::caller;
 use crate::db::Db;
-use crate::db::permissions::PgPolicyStore;
+use crate::db::permissions::DbPolicyStore;
 use crate::db::permissions::WILDCARD_RESOURCE_PATTERN;
 use crate::db::principals;
 use crate::db::resources;
@@ -90,7 +90,7 @@ impl AuthApiService {
             &self.jwt_audience,
         )?;
 
-        principals::find_active_principal(db.pool(), principal_id)
+        principals::find_active_principal(db, principal_id)
             .await
             .map_err(|err| {
                 tracing::warn!(error = %err, %principal_id, "principal lookup failed");
@@ -214,7 +214,7 @@ impl epic_urc::urc_auth_api_server::UrcAuthApi for AuthApiService {
             .resolve_caller(&db, authorization.as_deref(), target_user_token.as_deref())
             .await?;
 
-        let policy = PgPolicyStore::new(db.pool().clone());
+        let policy = DbPolicyStore::new(db.clone());
         let granted = policy
             .resolve_resource_permissions(&principal, &req.resource_id)
             .await
@@ -274,14 +274,14 @@ impl epic_urc::urc_auth_api_server::UrcAuthApi for AuthApiService {
             .resolve_caller(&db, authorization.as_deref(), None)
             .await?;
 
-        let candidates = resources::list_resource_ids_with_prefix(db.pool(), &req.resource_filter)
+        let candidates = resources::list_resource_ids_with_prefix(&db, &req.resource_filter)
             .await
             .map_err(|err| {
                 tracing::warn!(error = %err, "resource candidate lookup failed");
                 Status::internal("resource lookup failed")
             })?;
 
-        let policy = PgPolicyStore::new(db.pool().clone());
+        let policy = DbPolicyStore::new(db.clone());
         let resource_permission = policy
             .resolve_resource_permissions(&principal, &candidates)
             .await
@@ -450,7 +450,7 @@ impl rebac::rebac_api_server::RebacApi for RebacApiService {
         validate_new_resource_id(&req.resource_id)?;
         let db = self.require_db()?;
 
-        match resources::create_resource(db.pool(), &req.resource_id, &req.resource_name).await {
+        match resources::create_resource(db, &req.resource_id, &req.resource_name).await {
             Ok(resources::CreateResourceOutcome::Created) => {
                 Ok(Response::new(rebac::CreateResourceResponse {}))
             }
@@ -483,7 +483,7 @@ impl rebac::rebac_api_server::RebacApi for RebacApiService {
         }
         let db = self.require_db()?;
 
-        resources::delete_resource(db.pool(), &req.resource_id)
+        resources::delete_resource(db, &req.resource_id)
             .await
             .map_err(|err| {
                 tracing::warn!(error = %err, resource_id = %req.resource_id, "delete_resource failed");

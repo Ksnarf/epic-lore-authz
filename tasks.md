@@ -814,3 +814,177 @@ out here on purpose), drive-letter paths, and real key material across
 every changed file (zero hits beyond the pre-existing PEM-marker string
 literals, not real key material); `proto/vendor/SHA256SUMS`
 untouched (no proto changes this pass).
+
+## Security review remediation, item 2: SQLite backend (2026-08-05)
+
+Goal: SQLite for dev and single-instance deployments, Postgres/RDS for
+multi-replica, both selectable at runtime, with the SQLite backend running
+the IDENTICAL authz test suite as Postgres -- not a subset, not a weaker
+parallel suite.
+
+- [x] `Db` restructured into an enum (`Db::Postgres(PostgresHandle)` /
+      `Db::Sqlite(SqliteHandle)`), selected in `Db::connect`
+      (`crates/lore-authz-server/src/db/mod.rs`) from `DATABASE_URL`'s own
+      scheme: `postgres://`/`postgresql://` -> Postgres, `sqlite:` ->
+      SQLite. Any other scheme is a startup `bail!`, not a silent
+      misconfiguration. [verified-e2e] both branches connect, migrate, and
+      pass the full test suite below against a real instance of each
+      backend.
+- [x] `lore_authz_core::policy::PolicyStore` used as the one common
+      interface, not restructured around it: `PgPolicyStore` (the PHASE 1a
+      name) is renamed `DbPolicyStore`, wraps `Arc<Db>`, and its single
+      `impl PolicyStore for DbPolicyStore` dispatches on `Db`'s variant
+      internally (`crates/lore-authz-server/src/db/permissions.rs`).
+      `crates/lore-authz-server/src/grpc.rs` was already calling this
+      engine only through the trait method (`policy.
+      resolve_resource_permissions(...)`) -- the only change needed there
+      was constructing `DbPolicyStore::new(db.clone())` instead of
+      `PgPolicyStore::new(db.pool().clone())`, since `Db` no longer exposes
+      a raw `.pool()` (there is no single pool type across both variants).
+- [x] `db::resources` / `db::principals` / `db::groups` / `db::permissions`
+      (`create_resource`, `delete_resource`, `list_resource_ids_with_prefix`,
+      `insert_principal`, `find_active_principal`, `insert_group`,
+      `add_member`, `grant`) all take `&Db` now and dispatch internally,
+      so every caller (`grpc.rs`, `tests/authz_suite`) is backend-agnostic.
+- [x] Query portability verified, not assumed -- and reported honestly
+      where it was NOT portable as-is:
+      - Runtime `sqlx::query`/`query_as` (never the compile-time `query!`
+        macros) was already the rule (see `db/mod.rs`'s module doc
+        comment) -- this held for the SQLite paths too, so no
+        `cargo build`-time database dependency was introduced.
+      - What DID port unchanged: `RETURNING` + `ON CONFLICT ... DO
+        NOTHING` upsert syntax (SQLite, bundled via `libsqlite3-sys`,
+        supports both), `LIKE ... ESCAPE`.
+      - What did NOT port and needed a real SQLite-specific query:
+        Postgres's `= ANY($1)` array bind (SQLite has no array type -- the
+        SQLite path builds a dynamic `IN (?, ?, ..., ?)` clause sized to
+        the input slice's length via `sqlite_placeholders`, never from a
+        value, so this is not an injection risk); `now()` (SQLite has no
+        such function -- `datetime('now')` instead); the `uuid` and
+        `text[]` column types (see below).
+- [x] `DB_SCHEMA` made an explicit no-op for SQLite, and SAID SO.
+      [verified-e2e] `Db::connect`'s SQLite branch (`db/mod.rs`) logs it at
+      startup unconditionally: info level if `DB_SCHEMA` is left at its
+      documented default, a WARNING if an operator set it to something
+      else (since that specifically suggests they expect it to do
+      something). Documented in `docs/configuration.md` (a dedicated "`DB_
+      SCHEMA` is a no-op under SQLite" section, not just a table cell) and
+      in `migrations_sqlite/0001_identities_resources_grants.sql`'s own
+      comment.
+- [x] Separate migration sets per dialect, kept in step.
+      `migrations_sqlite/0001_identities_resources_grants.sql` mirrors
+      `migrations/0001_identities_resources_grants.sql` table-for-table.
+      Representation differences forced by SQLite, documented in that
+      file's own comment: no `CREATE SCHEMA`; `uuid` columns are TEXT
+      holding the canonical hyphenated string (converted explicitly at the
+      Rust boundary in `db/principals.rs` et al., never relying on sqlx's
+      own Uuid<->Sqlite blob encoding -- deliberately, for auditability);
+      `timestamptz` columns are TEXT with a `datetime('now')` default
+      (nothing in this codebase parses them back into Rust, only
+      `IS NULL` / overwrite); `roles.permissions` (a Postgres `text[]`)
+      is normalized into a `role_permissions(role_id, permission)` join
+      table, aggregated back into the identical `Vec<String>` shape via
+      `GROUP_CONCAT` in `db/permissions.rs`'s SQLite query path. The three
+      built-in role ids (`ROLE_READER`/`ROLE_WRITER`/`ROLE_ADMIN`) are the
+      same UUIDs on both backends, so application code never branches on
+      them.
+- [x] README.md and docs/configuration.md: SQLite is dev/single-instance
+      ONLY, stated prominently, not buried. `docs/configuration.md` gained
+      a dedicated "Choosing a database backend: Postgres vs SQLite"
+      section (linked from the `DATABASE_URL` table row, not left as a
+      footnote) spelling out the single-writer-lock reasoning; `README.md`
+      gained a "What this is NOT" bullet with the same warning plus a
+      pointer to that section. `.env.example`'s `DATABASE_URL` comment
+      documents both schemes and the same warning.
+- [x] HARD REQUIREMENT: SQLite runs the IDENTICAL authz test suite as
+      Postgres. [verified-e2e] Restructured
+      `crates/lore-authz-server/tests/postgres_backed.rs` (formerly a
+      single ~880-line file with all 20 test bodies inline) into
+      `tests/authz_suite/mod.rs` (the `Harness` and all 20 test bodies,
+      each taking a `Backend` parameter -- `Backend::Postgres` /
+      `Backend::Sqlite`) plus two thin wrapper files,
+      `tests/postgres_backed.rs` and `tests/sqlite_backed.rs`, each
+      `#[path]`-including the shared module and calling every one of the
+      20 shared bodies with its own `Backend`. There is exactly ONE copy of
+      each test body's logic; updating one backend's coverage without the
+      other is structurally impossible, not just discouraged by
+      convention. `fresh_db` gives each Postgres test its own throwaway
+      schema (as before) and each SQLite test its own throwaway temp-file
+      database (`std::env::temp_dir()` + a fresh UUID per test) -- SQLite's
+      per-test isolation is if anything STRONGER than Postgres's, a
+      genuinely separate database file rather than a schema inside a
+      shared instance. `database_failure_denies_rather_than_grants` (which
+      closes the connection pool mid-test to simulate a real DB failure)
+      now goes through a new `Db::close()` that dispatches to whichever
+      pool variant is live, so this case is real on both backends, not
+      Postgres-only.
+      Both backends were run standalone AND together; see the proof
+      section below for the raw counts. No case was dropped, weakened, or
+      left Postgres-only to hit this bar.
+
+**Proof (this pass, all four checks run for real in the pinned Docker build
+image, `docker/Dockerfile.build`, Docker reached via PowerShell; the
+Postgres-dependent tests via `docker compose -f docker-compose.test.yml run
+--rm --build tests`, which runs the FULL `cargo test --workspace` including
+the SQLite-backed tests in the same invocation):**
+
+- `cargo build --workspace`: clean, `Finished` dev profile.
+- `cargo test --workspace`: **74 tests pass, 0 failures**, across BOTH
+  backends:
+  - `lore-authz-core` / `lore-authz-proto`: 0 tests (unchanged).
+  - `lore-authz-server` unit tests: **30**, unchanged from the Task 1 pass
+    (this pass touched no unit test).
+  - `tests/lore_compat.rs`: **4**, unchanged.
+  - `tests/postgres_backed.rs` (real Postgres 16 container): **20 pass**.
+    Test names: `wildcard_grant_allows_any_registered_resource`,
+    `specific_repository_grant_does_not_cover_other_repositories`,
+    `user_with_no_grants_denies_everything`, `group_inherited_grant`,
+    `service_account_direct_grant`,
+    `lookup_user_permissions_returns_exact_scoped_set_no_more_no_less`,
+    `lookup_user_permissions_specific_only_does_not_leak_other_resources`,
+    `nonexistent_resource_is_denied_not_errored`,
+    `unknown_principal_id_denies_check`,
+    `unknown_principal_id_denies_lookup`,
+    `missing_bearer_token_is_unauthenticated`,
+    `database_failure_denies_rather_than_grants`,
+    `check_user_permission_with_explicit_target_user_token`,
+    `create_resource_is_idempotent`,
+    `delete_resource_revokes_access_and_is_idempotent`,
+    `rebac_create_resource_denies_unauthenticated_caller_against_real_db`,
+    `rebac_delete_resource_denies_unauthenticated_caller_against_real_db`,
+    `rebac_create_resource_denies_wrong_service_token_against_real_db`,
+    `rebac_create_resource_rejects_wildcard_sentinel_against_real_db`,
+    `migrations_are_idempotent`.
+  - `tests/sqlite_backed.rs` (real SQLite file per test, no external
+    service needed): **20 pass -- the EXACT SAME 20 names as above**, each
+    calling the identical shared body in `tests/authz_suite/mod.rs` with
+    `Backend::Sqlite` instead of `Backend::Postgres`. Also run standalone
+    (`cargo test --workspace --test sqlite_backed`, no Postgres running at
+    all) with the same 20/20 result, confirming SQLite needs nothing
+    external.
+- `cargo fmt --all -- --check`: clean (one `cargo fmt --all` pass applied
+  first; whitespace/line-wrap only across the new/changed `db/*.rs`,
+  `tests/authz_suite/mod.rs`, `tests/postgres_backed.rs`,
+  `tests/sqlite_backed.rs`, `main.rs`; no logic changed).
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean. One real
+  fix required: `std::iter::repeat("?").take(n)` in
+  `db/permissions.rs`'s `sqlite_placeholders` triggered
+  `clippy::manual_repeat_n`; rewritten to `std::iter::repeat_n("?", n)` per
+  clippy's own suggestion.
+
+Also verified this pass: `git status --short` / `git log --oneline -4` (see
+below); `sha256sum proto/vendor/{auth_api,rebac_api}.proto` recomputed and
+diffed byte-for-byte against `proto/vendor/SHA256SUMS` (unchanged -- this
+pass touched no proto file); a repo-wide non-ASCII scan of every
+changed/new file (clean); a grep for embargo-sensitive terms, the
+operator's real name, drive-letter paths, and real key material across
+every changed/new file (clean).
+
+**Left open / explicitly out of scope for this pass**: OIDC/SAML-backed
+`idp_connections`, key rotation, audit_log, and every other Phase 1b/2/3
+item in this file are untouched -- this pass was scoped to the backend
+abstraction and its test parity, nothing else. The Postgres schema/queries
+themselves were not changed (only how they are reached: through `&Db`
+instead of `&PgPool`), so Task 1's PHASE 1a behavior is unchanged on
+Postgres, which the identical 20/20 Postgres pass count (same as
+post-Task-1) confirms.

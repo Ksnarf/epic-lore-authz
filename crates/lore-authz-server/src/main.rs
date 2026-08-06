@@ -48,15 +48,20 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // PHASE 1a (see tasks.md): LookupUserPermissions, CheckUserPermission,
-    // and RebacApi::CreateResource/DeleteResource are Postgres-backed. If
-    // DATABASE_URL is not configured, those four RPCs fail closed with
-    // Status::failed_precondition (see AuthApiService::require_db /
-    // RebacApiService::require_db in grpc.rs) rather than the process
-    // refusing to start -- HealthCheck, JWKS, and the still-stubbed Phase 1b
-    // RPCs have no Postgres dependency at all. A DATABASE_URL that IS set
-    // but unreachable, or a DB_SCHEMA that fails validation, is a startup
-    // failure (bail), not a silent degrade: a misconfigured value an
-    // operator believes is live must not fail quietly.
+    // and RebacApi::CreateResource/DeleteResource are database-backed,
+    // against either Postgres (multi-replica, required behind a load
+    // balancer) or SQLite (dev/single-instance ONLY -- its single-writer
+    // lock makes it wrong behind a load balancer), selected at runtime from
+    // DATABASE_URL's scheme -- see lore_authz_server::db's module doc
+    // comment and docs/configuration.md. If DATABASE_URL is not configured,
+    // those four RPCs fail closed with Status::failed_precondition (see
+    // AuthApiService::require_db / RebacApiService::require_db in grpc.rs)
+    // rather than the process refusing to start -- HealthCheck, JWKS, and
+    // the still-stubbed Phase 1b RPCs have no database dependency at all. A
+    // DATABASE_URL that IS set but unreachable, or a DB_SCHEMA that fails
+    // validation (Postgres only), is a startup failure (bail), not a silent
+    // degrade: a misconfigured value an operator believes is live must not
+    // fail quietly.
     let db = if config.database_url.is_empty() {
         warn!(
             "DATABASE_URL is not set: LookupUserPermissions, CheckUserPermission, and RebacApi \
@@ -67,8 +72,14 @@ async fn main() -> anyhow::Result<()> {
     } else {
         let db = Db::connect(&config.database_url, &config.db_schema)
             .await
-            .context("connecting to Postgres / applying migrations (DATABASE_URL, DB_SCHEMA)")?;
-        info!(schema = %db.schema(), "connected to Postgres and applied migrations");
+            .context(
+                "connecting to the database / applying migrations (DATABASE_URL, DB_SCHEMA)",
+            )?;
+        info!(
+            backend = db.backend_name(),
+            schema = %db.schema(),
+            "connected to the database and applied migrations"
+        );
         Some(Arc::new(db))
     };
 

@@ -38,10 +38,17 @@ several gotchas that fail silently rather than loudly.
   promise enforcement `lore-server` itself does not perform.
 - Not (yet) a finished product. See `tasks.md`. As of PHASE 1a,
   `LookupUserPermissions`, `CheckUserPermission`, and
-  `RebacApi::CreateResource`/`DeleteResource` are real, Postgres-backed
+  `RebacApi::CreateResource`/`DeleteResource` are real, database-backed
   logic (see `docs/data-model.md`); the auth-session login flow
   (`StartAuthSession`/`GetAuthSession`/`ExchangeUserTokenForMultiresourceToken`),
   OIDC, and SAML are still `Status::unimplemented` stubs (Phase 1b/2).
+- **SQLite is a dev / single-instance convenience, not a production
+  multi-replica option.** Two backends are supported, selected at runtime
+  from `DATABASE_URL`'s scheme: Postgres (`postgres://`) and SQLite
+  (`sqlite:`). SQLite's single-writer file lock makes it the wrong choice
+  behind a load balancer or with more than one replica of this service
+  running -- use Postgres/RDS for that. See docs/configuration.md's
+  "Choosing a database backend" section.
 
 ## License and attribution
 
@@ -81,21 +88,28 @@ Then point an unmodified `lore-server` at it:
 
 ## Testing
 
-`crates/lore-authz-server/tests/postgres_backed.rs` runs against a REAL
-Postgres container, not a mock -- see `docs/data-model.md` for what it
-proves. To run it with nothing but Docker:
+`crates/lore-authz-server/tests/authz_suite/` is the one shared
+authorization test suite, run against BOTH backends -- `tests/
+postgres_backed.rs` (real Postgres, not a mock) and `tests/sqlite_backed.rs`
+(real SQLite file, not a mock) are thin wrappers calling the exact same test
+bodies, so SQLite is never a lesser-tested path. See `docs/data-model.md`
+for what the suite proves. To run everything with nothing but Docker:
 
 ```sh
 docker compose -f docker-compose.test.yml run --rm --build tests
 docker compose -f docker-compose.test.yml down -v   # tear down the throwaway Postgres
 ```
 
-This also runs every other test in the workspace (`cargo test --workspace`
-is the compose service's command). `docker-compose.test.yml` never touches
-a shared or long-lived database: `postgres` there uses a `tmpfs` data
-directory, and the tests each create their own randomly-named schema, never
-a database. `.github/workflows/ci.yml` runs the same suite against a
-GitHub Actions Postgres service container on every push/PR.
+This runs every test in the workspace (`cargo test --workspace` is the
+compose service's command): unit tests, the lore-server compat suite, and
+the shared authz suite against both a real throwaway Postgres container AND
+a real throwaway SQLite file per test -- `docker-compose.test.yml` never
+touches a shared or long-lived database: `postgres` there uses a `tmpfs`
+data directory, the Postgres-backed tests each create their own
+randomly-named schema, and the SQLite-backed tests each get their own
+temp-file database, never a shared one. `.github/workflows/ci.yml` runs the
+same suite against a GitHub Actions Postgres service container on every
+push/PR (the SQLite tests need no service container at all).
 
 ## Repository layout
 
@@ -107,6 +121,9 @@ epic-lore-authz/
     lore-authz-proto/           tonic-build with build_server(true) -- the crux of the project
     lore-authz-core/            domain types + I/O-free traits, no business logic implemented yet
     lore-authz-server/          the binary: gRPC + HTTP listeners, config, stubbed RPC handlers
+      migrations/                 Postgres migrations
+      migrations_sqlite/          SQLite migrations (kept in step with the above by hand)
+      tests/authz_suite/           shared authz test bodies, run against both backends
   docs/                         architecture, protocol gotchas, open questions, config reference
   .github/workflows/            ci.yml (fmt/build/test/clippy), proto-drift.yml (upstream drift guard)
   tasks.md                      phased delivery plan with pass/fail proof criteria per phase

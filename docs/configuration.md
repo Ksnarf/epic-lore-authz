@@ -11,8 +11,8 @@ Every value in `.env.example` is a placeholder. Never commit a real `.env`
 
 | Variable | Required | Default | Notes |
 |---|---|---|---|
-| `DATABASE_URL` | PHASE 1a | (none) | Standard Postgres connection string. Required for `LookupUserPermissions`, `CheckUserPermission`, and `RebacApi::CreateResource`/`DeleteResource` to do anything but fail closed with `Status::failed_precondition` (see `main.rs`); everything else in this scaffold has no Postgres dependency. |
-| `DB_SCHEMA` | no | `loreauth` | This product owns exactly one schema; never `public`, never a dedicated database, never superuser. See `docs/data-model.md`. Migrations run automatically at startup against this schema (connecting IS migrating -- there is no separate migrate command). |
+| `DATABASE_URL` | PHASE 1a | (none) | A Postgres (`postgres://`/`postgresql://`) OR SQLite (`sqlite:`) connection string -- the backend is selected from this scheme at runtime, see the dedicated "Choosing a backend" section below. **Read that section before picking SQLite for anything but local dev.** Required for `LookupUserPermissions`, `CheckUserPermission`, and `RebacApi::CreateResource`/`DeleteResource` to do anything but fail closed with `Status::failed_precondition` (see `main.rs`); everything else in this scaffold has no database dependency. |
+| `DB_SCHEMA` | no | `loreauth` | **Postgres only.** This product owns exactly one schema; never `public`, never a dedicated database, never superuser. See `docs/data-model.md`. Migrations run automatically at startup against this schema (connecting IS migrating -- there is no separate migrate command). **Under the `sqlite:` backend this is an explicit NO-OP** (SQLite has no schema concept) -- logged at startup, not silently ignored; see the "Choosing a backend" section below. |
 | `JWT_ISSUER` | yes | (none) | `iss` claim on every minted token. |
 | `JWT_AUDIENCE` | yes | (none) | Comma-separated root domains. Must include the lore server's own root domain -- see `docs/protocol-notes.md` section 3. |
 | `TOKEN_ENV` | no | `dev` | Value placed in the `env` claim of every minted token. Required by lore-server on both claim shapes -- see `docs/protocol-notes.md` section 2. |
@@ -26,6 +26,51 @@ Every value in `.env.example` is a placeholder. Never commit a real `.env`
 | `OIDC_ISSUER_URL` / `OIDC_CLIENT_ID` / `OIDC_CLIENT_SECRET` / `OIDC_REDIRECT_URL` | Phase 1 | (none) | Single-tenant local-dev bring-up. Multi-IdP deployments configure `idp_connections` in the database instead. |
 | `SAML_SP_ENTITY_ID` / `SAML_IDP_METADATA_URL` | Phase 2 | (none) | Behind the `saml` cargo feature. |
 | `RUST_LOG` | no | `info` | Standard `tracing_subscriber::EnvFilter` syntax. |
+
+## Choosing a database backend: Postgres vs SQLite
+
+`DATABASE_URL`'s scheme selects the backend at runtime (`crates/
+lore-authz-server/src/db/mod.rs`'s `Db::connect`): `postgres://` /
+`postgresql://` for Postgres, `sqlite:` for SQLite. No other config
+distinguishes them.
+
+**SQLite is dev / single-instance ONLY. Do not put it behind a load
+balancer or run more than one replica against it.** SQLite uses a
+single-writer file lock: a second process (a second replica of this
+service) opening the same database file will serialize behind that lock at
+best, and can hit "database is locked" errors under real concurrent write
+load at worst -- this product does nothing to coordinate writers across
+processes, and SQLite itself has no multi-writer story to lean on. If you
+are running more than one instance of this service, or expect to, **use
+Postgres/RDS**, which is what multi-replica deployments require.
+
+Where SQLite is a good fit: local development, a single-instance bring-up,
+CI, or any deployment that is genuinely one process talking to one file.
+
+Both backends run the IDENTICAL authorization logic and the IDENTICAL test
+suite (`crates/lore-authz-server/tests/authz_suite/`, run against both via
+`tests/postgres_backed.rs` and `tests/sqlite_backed.rs` -- see
+`docker-compose.test.yml`). Choosing SQLite is not choosing a lesser-tested
+path; it is choosing a backend that does not scale past one writer.
+
+Separate migration sets are kept in step by hand: `migrations/` (Postgres)
+and `migrations_sqlite/` (SQLite), both applied automatically by `Db::
+connect` for whichever backend is live. See `migrations_sqlite/0001_
+identities_resources_grants.sql`'s own comment for the handful of
+SQLite-forced representation differences (no schema, `uuid` columns as
+TEXT, `roles.permissions` normalized into a join table instead of a Postgres
+array column) -- none of them change the authorization semantics, only how
+they are stored.
+
+## `DB_SCHEMA` is a no-op under SQLite -- said explicitly, not left implicit
+
+SQLite has no schema concept at all, so `DB_SCHEMA` does nothing when
+`DATABASE_URL` uses the `sqlite:` scheme. This is NOT silently swallowed:
+`Db::connect`'s SQLite path logs it at startup every time (info level if
+`DB_SCHEMA` is left at its documented default `loreauth`, a warning if an
+operator explicitly set it to something else, since that specifically
+suggests they expect it to do something here). If you are configuring
+SQLite, you can leave `DB_SCHEMA` unset; it is inert either way.
 
 ## Why `JWT_AUDIENCE` is a list, and why it matters more than it looks
 
