@@ -593,11 +593,15 @@ fn algorithm_from_key_algorithm(value: KeyAlgorithm) -> Option<Algorithm> {
 
 #[cfg(test)]
 mod tests {
+    use axum::Json;
+    use axum::Router;
+    use axum::routing::get;
     use jsonwebtoken::jwk::AlgorithmParameters;
     use jsonwebtoken::jwk::CommonParameters;
     use jsonwebtoken::jwk::EllipticCurve;
     use jsonwebtoken::jwk::EllipticCurveKeyParameters;
     use jsonwebtoken::jwk::EllipticCurveKeyType;
+    use serde_json::json;
 
     use super::*;
 
@@ -743,5 +747,55 @@ mod tests {
         .unwrap();
         assert_eq!(provider.issuer(), "https://idp.example.com");
         assert_eq!(provider.config.scopes, "openid profile");
+    }
+
+    /// This is the sole defense against provider substitution via a
+    /// hijacked discovery URL (OIDC Discovery section 4.3, see the
+    /// `discovery()` comment above). It needs no real identity provider to
+    /// exercise: a trivial in-process HTTP server that serves a discovery
+    /// document whose `issuer` disagrees with the URL it was fetched from
+    /// is enough to prove the refusal is real, not merely read.
+    #[tokio::test]
+    async fn a_discovery_document_whose_issuer_disagrees_with_its_url_is_refused() {
+        async fn serve_mismatched_discovery() -> Json<serde_json::Value> {
+            Json(json!({
+                "issuer": "http://not-the-issuer-you-fetched-me-from.invalid",
+                "authorization_endpoint": "http://not-the-issuer-you-fetched-me-from.invalid/auth",
+                "token_endpoint": "http://not-the-issuer-you-fetched-me-from.invalid/token",
+                "jwks_uri": "http://not-the-issuer-you-fetched-me-from.invalid/keys",
+            }))
+        }
+
+        let app = Router::new().route(
+            "/.well-known/openid-configuration",
+            get(serve_mismatched_discovery),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        // The issuer we configure is the address we actually fetch from --
+        // exactly what an operator would set. The mock server's document
+        // claims to be a completely different issuer, which is the
+        // provider-substitution shape this check exists to catch.
+        let provider = OidcProvider::new(OidcConfig {
+            issuer: format!("http://{local_addr}"),
+            client_id: "client".to_string(),
+            client_secret: "secret".to_string(),
+            redirect_url: "https://authz.example.com/oidc/callback".to_string(),
+            scopes: "openid".to_string(),
+        })
+        .unwrap();
+
+        let err = provider
+            .authorization_url("state", "nonce", "verifier")
+            .await
+            .expect_err("a discovery document advertising a different issuer must be refused");
+        assert!(
+            matches!(err, OidcError::Discovery),
+            "expected OidcError::Discovery, got {err:?}"
+        );
     }
 }

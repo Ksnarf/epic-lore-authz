@@ -442,9 +442,13 @@ integration test has actually been run and its output logged.
         refused_at_construction`), but NOT through the HTTP routes -- the
         browser routes' `login_not_configured_page` path is `[code-says]`,
         read but not executed by a test.
-      - **The issuer-mismatch refusal in discovery is `[code-says]`**: it
-        would need a second, deliberately-misconfigured provider to exercise
-        for real, and the real one always agrees with itself.
+      - **The issuer-mismatch refusal in discovery is now `[verified-e2e]`**:
+        the earlier claim here (that it would need a second, deliberately-
+        misconfigured *provider*) was wrong -- it only needs a discovery
+        *document* whose issuer disagrees with the URL it was fetched from,
+        which a trivial in-process mock HTTP server produces with no real
+        IdP involved. See `oidc::tests::
+        a_discovery_document_whose_issuer_disagrees_with_its_url_is_refused`.
       - The `ProviderUnavailable` pages are `[code-says]` for the same
         reason (the test IdP is always up).
 
