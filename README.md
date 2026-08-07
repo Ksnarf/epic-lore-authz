@@ -86,6 +86,29 @@ Then point an unmodified `lore-server` at it:
 - `auth.jwt_issuer` / `auth.jwt_audience` -> matching `JWT_ISSUER` /
   `JWT_AUDIENCE` in this project's config (see `docs/configuration.md`)
 
+## Prebuilt binaries
+
+Every tag matching `v*` builds both binaries below on native `ubuntu-24.04`
+CI runners (see `.github/workflows/release.yml`) and attaches them, plus a
+`SHA256SUMS` file, to a GitHub Release -- no local Rust toolchain needed,
+and no cross-arch/emulated build:
+
+```text
+https://github.com/Ksnarf/epic-lore-authz/releases/download/<tag>/lore-authz-server-linux-amd64
+https://github.com/Ksnarf/epic-lore-authz/releases/download/<tag>/loreserver-linux-amd64
+https://github.com/Ksnarf/epic-lore-authz/releases/download/<tag>/SHA256SUMS
+```
+
+`loreserver` there is a **patched** build (adds an optional
+`[server.auth] rebac_service_token` -- see that release's notes for exactly
+what it does), not a vanilla upstream `EpicGames/lore` binary. Verify and
+run:
+
+```sh
+sha256sum -c SHA256SUMS
+chmod +x lore-authz-server-linux-amd64 loreserver-linux-amd64
+```
+
 ## Testing
 
 `crates/lore-authz-server/tests/authz_suite/` is the one shared
@@ -143,7 +166,8 @@ epic-lore-authz/
       migrations_sqlite/          SQLite migrations (kept in step with the above by hand)
       tests/authz_suite/           shared authz test bodies, run against both backends
   docs/                         architecture, protocol gotchas, open questions, config reference
-  .github/workflows/            ci.yml (fmt/build/test/clippy), proto-drift.yml (upstream drift guard)
+  .github/workflows/            ci.yml (fmt/build/test/clippy), proto-drift.yml (upstream drift guard),
+                                 release.yml (tag push -> both binaries on a GitHub Release)
   tasks.md                      phased delivery plan with pass/fail proof criteria per phase
 ```
 

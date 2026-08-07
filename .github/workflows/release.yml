@@ -1,0 +1,292 @@
+name: release
+
+# Builds and publishes the two binaries an operator needs to run this
+# project, so neither has to be built by hand on a workstation:
+#
+#   - lore-authz-server: this repo's own sidecar binary, built at the tagged
+#     commit.
+#   - loreserver: EpicGames/lore's server binary, built from a PATCHED fork
+#     (see PATCHED_LORE_* below). It is NOT a vanilla upstream Epic build --
+#     see the "Write release notes" step, which says so in the release body
+#     itself, not just here.
+#
+# Runs on ubuntu-24.04 specifically because its glibc (2.39) matches the
+# deployment target exactly. The "Verify runner glibc" step below checks
+# this for real on every run rather than trusting the comment; the
+# "Verify built binaries" step does the same check against the two
+# binaries this job produces.
+#
+# Native amd64 runners are the whole point of this workflow: building
+# linux/amd64 under QEMU emulation on an Apple Silicon machine is what this
+# replaces.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: >-
+          Release tag to create/use. Required only when running this by
+          hand against a branch (a tag push already supplies this).
+        required: false
+      lore_ref:
+        description: >-
+          Override PATCHED_LORE_REF for this run only (a commit SHA in the
+          patched fork). Leave blank to use the pinned value below.
+        required: false
+
+permissions:
+  contents: write # only permission this workflow needs: create the release
+
+env:
+  CARGO_TERM_COLOR: always
+  # Where loreserver is built from. This is a personal fork carrying one
+  # small patch on top of the same commit epic-lore-authz's proto vendoring
+  # is pinned to (see proto/vendor/UPSTREAM.md) -- NOT EpicGames/lore, and
+  # NOT the fork's main branch. Bumping this after rebasing the patch onto
+  # a newer Epic release is a one-line change here, not a workflow edit.
+  # `workflow_dispatch` can override it for one-off runs via the `lore_ref`
+  # input without editing this file at all.
+  PATCHED_LORE_REPO: Ksnarf/epic-lore
+  PATCHED_LORE_BRANCH: feat/rebac-service-token
+  PATCHED_LORE_REF: 4185ed407b34f8580a74c5d2b789e1f44dcf83c2
+  UPSTREAM_LORE_REPO: EpicGames/lore
+  UPSTREAM_BASE_COMMIT: f205899adf24b13b2d28e5c08d9256ac99c69f0c
+  MAX_GLIBC: "2.39"
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Verify runner glibc is 2.39 (matches the deployment target)
+        run: |
+          set -euo pipefail
+          ver="$(getconf GNU_LIBC_VERSION | awk '{print $2}')"
+          echo "runner glibc: $ver"
+          if [ "$ver" != "$MAX_GLIBC" ]; then
+            echo "::error::runner glibc is $ver, expected $MAX_GLIBC. ubuntu-24.04 is pinned in this workflow specifically because its glibc matches the deployment target -- either the runner image changed underneath this pin, or that assumption needs re-checking before releasing anything." >&2
+            exit 1
+          fi
+
+      - name: Resolve release tag
+        id: tag
+        run: |
+          set -euo pipefail
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            tag="${{ github.ref_name }}"
+          elif [ -n "${{ github.event.inputs.tag_name }}" ]; then
+            tag="${{ github.event.inputs.tag_name }}"
+          else
+            echo "::error::workflow_dispatch needs the 'tag_name' input when it is not run against a tag ref." >&2
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "resolved release tag: $tag"
+
+      - name: Resolve patched-fork ref
+        id: lore
+        run: |
+          set -euo pipefail
+          ref="${{ github.event.inputs.lore_ref }}"
+          if [ -z "$ref" ]; then
+            ref="$PATCHED_LORE_REF"
+          fi
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "building loreserver from $PATCHED_LORE_REPO@$ref"
+
+      # actions/checkout v7.0.1, pinned by commit SHA per this repo's
+      # action-hardening practice (a moved tag is a supply-chain risk we
+      # would rather not carry into a release workflow).
+      - name: Checkout epic-lore-authz
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: epic-lore-authz
+          persist-credentials: false # this job never pushes; gh release create uses github.token directly
+
+      # Checked out as a BUILD INPUT only. Nothing here ever writes to this
+      # checkout, and no workflow is ever added to that repo -- its tree has
+      # to stay pristine so it can keep being rebased onto Epic's releases.
+      - name: Checkout patched lore fork (build input only)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.PATCHED_LORE_REPO }}
+          ref: ${{ steps.lore.outputs.ref }}
+          path: lore-fork
+          persist-credentials: false
+
+      # dtolnay/rust-toolchain has no version tags; it is pinned to the
+      # head commit of its "1.97.1" branch instead, which matches this
+      # repo's rust-toolchain.toml and docker/Dockerfile.build.
+      - name: Install Rust 1.97.1
+        uses: dtolnay/rust-toolchain@032958afbdc797a9164d3bc0b56325c1308924a5 # 1.97.1
+
+      # Exactly the list this repo already proved builds both crates cleanly
+      # (see e2e-run/Dockerfile.lore-build). libprotobuf-dev specifically --
+      # not just protobuf-compiler -- because lore's codegen needs the
+      # well-known-types includes Debian/Ubuntu's protobuf-compiler omits.
+      - name: Install system dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential protobuf-compiler libprotobuf-dev pkg-config \
+            libssl-dev cmake clang git ca-certificates
+
+      # file/binutils are for the "Verify built binaries" step below, not
+      # for building -- kept as a separate install so the list above stays
+      # an exact match for what building actually needs.
+      - name: Install verification tools
+        run: sudo apt-get install -y --no-install-recommends file binutils
+
+      - name: Cache cargo registry and target directories
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            epic-lore-authz/target
+            lore-fork/target
+          key: release-cargo-${{ runner.os }}-${{ hashFiles('epic-lore-authz/Cargo.lock', 'lore-fork/Cargo.lock') }}
+          restore-keys: |
+            release-cargo-${{ runner.os }}-
+
+      - name: Build lore-authz-server
+        working-directory: epic-lore-authz
+        run: cargo build --release --package lore-authz-server
+
+      - name: Build loreserver (patched fork)
+        working-directory: lore-fork
+        run: cargo build --profile release-lto --package lore-server
+
+      # release-lto (see the fork's root Cargo.toml) keeps debug info
+      # (debug = 2) for local debugging; a shipped release artifact does
+      # not need it and it only adds size, so strip it before packaging.
+      - name: Strip loreserver debug info
+        run: strip --strip-debug lore-fork/target/release-lto/loreserver
+
+      - name: Stage artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp epic-lore-authz/target/release/lore-authz-server dist/lore-authz-server-linux-amd64
+          cp lore-fork/target/release-lto/loreserver dist/loreserver-linux-amd64
+
+      # Fails the job on any check failing: wrong architecture, a GLIBC
+      # symbol version newer than the deployment target has, or an
+      # unresolved shared library. A binary that cannot exec on the target
+      # must not reach a release.
+      - name: Verify built binaries
+        run: |
+          set -euo pipefail
+          verify() {
+            bin="$1"
+            echo "===== verifying $bin ====="
+
+            echo "-- file --"
+            file_out="$(file -b "$bin")"
+            echo "$file_out"
+            case "$file_out" in
+              *"ELF 64-bit"*"x86-64"*) ;;
+              *)
+                echo "::error::$bin is not an ELF 64-bit x86-64 binary: $file_out" >&2
+                return 1
+                ;;
+            esac
+
+            echo "-- required GLIBC symbol versions (max allowed: $MAX_GLIBC) --"
+            versions="$(objdump -T "$bin" | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sed 's/GLIBC_//' | sort -V -u || true)"
+            if [ -z "$versions" ]; then
+              # Both binaries here are expected to be normal dynamically
+              # linked Rust/glibc executables, which always reference at
+              # least GLIBC_2.2.5. Finding none is a sign the build or this
+              # check itself is broken, not a legitimate static-binary case
+              # -- treat it as a failure rather than pass silently.
+              echo "::error::$bin has no GLIBC_x.y versioned symbols at all -- expected a dynamically linked glibc binary" >&2
+              return 1
+            fi
+            echo "$versions"
+            highest="$(printf '%s\n' "$versions" | tail -1)"
+            highest_of_pair="$(printf '%s\n%s\n' "$highest" "$MAX_GLIBC" | sort -V | tail -1)"
+            if [ "$highest_of_pair" != "$MAX_GLIBC" ]; then
+              echo "::error::$bin requires GLIBC $highest, newer than $MAX_GLIBC (ubuntu-24.04 / the deployment target). It would fail to exec there." >&2
+              return 1
+            fi
+            echo "highest required: $highest (OK, <= $MAX_GLIBC)"
+
+            echo "-- ldd --"
+            ldd_out="$(ldd "$bin" 2>&1)" || true
+            echo "$ldd_out"
+            if printf '%s\n' "$ldd_out" | grep -qE "not found|not a dynamic executable"; then
+              echo "::error::$bin has an unresolved shared library dependency, or is not a dynamic executable" >&2
+              return 1
+            fi
+          }
+
+          fail=0
+          verify dist/lore-authz-server-linux-amd64 || fail=1
+          verify dist/loreserver-linux-amd64 || fail=1
+          exit "$fail"
+
+      - name: Compute checksums
+        working-directory: dist
+        run: sha256sum lore-authz-server-linux-amd64 loreserver-linux-amd64 > SHA256SUMS && cat SHA256SUMS
+
+      - name: Write release notes
+        run: |
+          cat > RELEASE_NOTES.md <<EOF
+          ## Binaries
+
+          | file | what it is |
+          | --- | --- |
+          | \`lore-authz-server-linux-amd64\` | This repo's SSO/authorization sidecar, built from this commit (\`${{ github.sha }}\`). |
+          | \`loreserver-linux-amd64\` | A **PATCHED** build of Epic's \`lore-server\`. See below. |
+
+          \`SHA256SUMS\` covers both. Verify with:
+          \`\`\`sh
+          sha256sum -c SHA256SUMS
+          \`\`\`
+
+          ## loreserver is a patched build, not an official Epic release
+
+          This is **not** a vanilla \`EpicGames/lore\` build and must not be mistaken for
+          one. It is built from:
+
+          - Repository: \`${{ env.PATCHED_LORE_REPO }}\`
+          - Branch: \`${{ env.PATCHED_LORE_BRANCH }}\`
+          - Build commit: \`${{ steps.lore.outputs.ref }}\`
+          - Based on upstream \`${{ env.UPSTREAM_LORE_REPO }}\` commit \`${{ env.UPSTREAM_BASE_COMMIT }}\`
+
+          The patch adds one optional setting, \`[server.auth] rebac_service_token\`.
+          When set, \`lore-server\` uses it to authenticate its own
+          \`CreateResource\`/\`DeleteResource\` calls to an external rebac service,
+          instead of forwarding the calling user's token for that hop. When unset,
+          behavior is unchanged from upstream. No other files are modified.
+
+          Both upstream \`EpicGames/lore\` and this fork are MIT licensed, which
+          permits building and redistributing this binary; this note exists so
+          nobody downstream mistakes it for an official Epic build.
+
+          ## Build
+
+          Runner: \`ubuntu-24.04\` (glibc 2.39, matching the deployment target).
+          Toolchain: Rust 1.97.1. See \`.github/workflows/release.yml\` for the exact
+          steps, including the ELF/GLIBC/\`ldd\` verification every binary in this
+          release passed before upload.
+          EOF
+          cat RELEASE_NOTES.md
+
+      - name: Create GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "${{ steps.tag.outputs.tag }}" \
+            dist/lore-authz-server-linux-amd64 \
+            dist/loreserver-linux-amd64 \
+            dist/SHA256SUMS \
+            --repo "${{ github.repository }}" \
+            --target "${{ github.sha }}" \
+            --title "${{ steps.tag.outputs.tag }}" \
+            --notes-file RELEASE_NOTES.md
