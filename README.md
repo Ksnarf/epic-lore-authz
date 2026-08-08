@@ -36,12 +36,16 @@ several gotchas that fail silently rather than loudly.
   authorization check only checks repository membership, never a
   permission string (see `docs/protocol-notes.md`). This project does not
   promise enforcement `lore-server` itself does not perform.
-- Not (yet) a finished product. See `tasks.md`. As of PHASE 1a,
-  `LookupUserPermissions`, `CheckUserPermission`, and
-  `RebacApi::CreateResource`/`DeleteResource` are real, database-backed
-  logic (see `docs/data-model.md`); the auth-session login flow
+- Not (yet) a finished product. See `tasks.md`.
+  `LookupUserPermissions`, `CheckUserPermission`,
+  `RebacApi::CreateResource`/`DeleteResource`, the auth-session login flow
   (`StartAuthSession`/`GetAuthSession`/`ExchangeUserTokenForMultiresourceToken`),
-  OIDC, and SAML are still `Status::unimplemented` stubs (Phase 1b/2).
+  OIDC login, and the `/admin` provisioning surface are all real,
+  database-backed logic (see `docs/data-model.md`). Still
+  `Status::unimplemented`: `RefreshAuthSession` (not supported upstream
+  either), `VerifyUser`, the API-key and external-token exchanges, and the
+  `GetUserInfo`/`GetUserId`/`GetProviderUserId` lookups. SAML and SCIM are
+  not started.
 - **SQLite is a dev / single-instance convenience, not a production
   multi-replica option.** Two backends are supported, selected at runtime
   from `DATABASE_URL`'s scheme: Postgres (`postgres://`) and SQLite
@@ -109,6 +113,12 @@ denied, including one presenting a token. There is no bypass flag. Treat the
 token as a root credential -- this surface can bind a principal to `urc-*`
 with the `admin` role -- and restrict `/admin` at your reverse proxy as
 well; `docs/configuration.md` has a worked example.
+
+**There is no audit log.** Nothing records which operator created a
+principal, granted `admin` over `urc-*`, or revoked a resource, nor when.
+The admin token is shared, so admin actions are not attributable to an
+individual even in principle. If you need an audit trail, put it in front
+of this service at the proxy, or do not expose `/admin` to people.
 
 Every state-changing admin request is additionally required to be
 **same-origin** with `PUBLIC_BASE_URL`. That is not redundant with the token:

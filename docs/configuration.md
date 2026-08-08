@@ -210,6 +210,12 @@ It is never logged, never echoed in an error, and `Config`'s `Debug`
 implementation renders it (and every other secret-valued setting) as
 `Some("<redacted>")`.
 
+There is NO AUDIT LOG of admin actions. Nothing records who created a
+principal, who bound one to `urc-*`, or when. Because the token is shared
+rather than per-operator, admin actions are not attributable to an
+individual even in principle. Anyone who needs an audit trail must capture
+it in front of this service, at the reverse proxy.
+
 ### Fail closed, with no bypass
 
 If `ADMIN_API_TOKEN` is unset or empty, EVERY request under `/admin` is
