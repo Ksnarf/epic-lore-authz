@@ -24,6 +24,7 @@ Every value in `.env.example` is a placeholder. Never commit a real `.env`
 | `SIGNING_KEY_SOURCE` | no | `file:///CHANGE_ME/signing-key.der` | Phase 0: a `file://` unencrypted PKCS#8 EC P-256 private key, PEM or raw DER (NOT a JWK -- see `crates/lore-authz-server/src/signing.rs`). If the file does not exist, an ephemeral dev key is generated in memory and a warning is logged. Phase 1+: real key management. |
 | `JWKS_PATH` | no | `/.well-known/jwks.json` | Path on the HTTP listener to serve this service's own JWKS on. |
 | `REBAC_SERVICE_TOKEN` | **yes, effectively** | (none) | Shared secret gating `RebacApi::CreateResource`/`DeleteResource` (security review remediation -- see `docs/open-questions.md` Q6). Present as `authorization: Bearer <value>` on those two RPCs only; unrelated to `JWT_ISSUER`/`JWT_AUDIENCE` and not a JWT. **Unset means both RPCs deny every caller** with `Status::unauthenticated` (`crates/lore-authz-server/src/service_auth.rs`) -- a deliberate fail-closed default, not a bug. See the dedicated section below for the honest gap this does and does not close. |
+| `ADMIN_API_TOKEN` | **yes to provision anything** | (none) | Shared secret gating the ENTIRE admin surface: the `/admin/v1` provisioning API and the `/admin/ui` panel, both on the HTTP listener. Present as `authorization: Bearer <value>`; a static secret, not a JWT. **Unset (or empty) means every `/admin` request is denied with 401**, including one presenting a token -- a deliberate fail-closed default with no bypass flag. See the dedicated section below: this setting can mint authority over every repository, so treat it as a root credential and restrict `/admin` at your reverse proxy too. |
 | `GRPC_LISTEN_ADDR` | no | `0.0.0.0:8443` | `UrcAuthApi` + `RebacApi`. Must be reachable over TLS trusted by the lore CLI's native roots in any real deployment. |
 | `HTTP_LISTEN_ADDR` | no | `0.0.0.0:8080` | JWKS, login, OIDC/SAML callbacks, health, metrics. |
 | `OIDC_ISSUER_URL` / `OIDC_CLIENT_ID` / `OIDC_CLIENT_SECRET` / `OIDC_REDIRECT_URL` | **yes for login** | (none) | The identity provider browser login runs against. **All four are required together** -- a partially configured provider is treated as UNCONFIGURED and every login denies. See the dedicated section below. Multi-IdP deployments will configure `idp_connections` in the database instead (Phase 2+); these env vars are the single-tenant bring-up. |
@@ -173,6 +174,107 @@ occasional "run `lore auth login` twice" and can raise
 Do not lower `AUTH_SESSION_TTL_SECS` below ~180: a session that expires
 INSIDE the CLI's own polling window turns a slow login into a silent
 failure, which is the one outcome worse than a timeout.
+
+## `ADMIN_API_TOKEN`: the admin surface, and how to expose it safely
+
+Until this setting exists in a deployment, there is no way to create a
+principal, a group, or a grant except by connecting to the database and
+writing SQL by hand. That was the one structural hole in an otherwise
+working product: `RebacApi::CreateResource` populates `resources` (called by
+lore-server), and OIDC login can JIT-provision a principal -- but a
+JIT-provisioned principal holds NO grants, so it authenticates and can see
+nothing until an operator grants it something, and nothing but `psql` could
+do that.
+
+`ADMIN_API_TOKEN` opens the surface that closes it:
+
+| Path | What it is |
+|---|---|
+| `/admin/v1/...` | A JSON API for scripting and automation: principals (list/get/create/set status), groups (list/create/add member/remove member), resources (list/create/soft-delete), grants (list/create/delete) and roles (list only). |
+| `/admin/ui` | A server-rendered HTML panel with the same lists and forms to create and to grant/revoke. No JavaScript, no separate build step; it ships inside the existing binary. |
+
+Both live under the single `/admin` path prefix, deliberately apart from the
+public `/.well-known/jwks.json`, `/login/*` and `/oidc/callback` routes, so a
+reverse proxy can restrict this deployment's whole administrative surface by
+path alone.
+
+### Treat this token as a root credential
+
+The admin surface can create a principal and bind it to `urc-*` with the
+`admin` role -- that is authority over every repository lore-server knows
+about. Generate a high-entropy value (for example
+`openssl rand -base64 32`), keep it in the same place as your other
+deployment secrets, and rotate it by changing this setting and restarting.
+
+It is never logged, never echoed in an error, and `Config`'s `Debug`
+implementation renders it (and every other secret-valued setting) as
+`Some("<redacted>")`.
+
+### Fail closed, with no bypass
+
+If `ADMIN_API_TOKEN` is unset or empty, EVERY request under `/admin` is
+denied with `401`, including one presenting a token, and including paths
+that do not exist. There is no development mode, no insecure flag, and no
+way to enable these routes without a token. Every denial is the identical
+response whatever the cause, so a probe cannot learn from the error whether
+a deployment has an admin token configured at all; the operator learns it
+from a warning in the startup log instead.
+
+### Reaching the panel from a browser
+
+Every `/admin` route requires the `Authorization` header -- there is no
+cookie and no login form, because adding a second, weaker credential path
+into a surface that can mint authority is not worth saving a line of proxy
+configuration. A browser cannot attach that header to an address-bar
+navigation on its own, so front the path with the same reverse proxy that
+should already be restricting it:
+
+```nginx
+location /admin/ {
+    allow 10.0.0.0/8;               # or mTLS, or a VPN-only listener
+    deny  all;
+    proxy_set_header Authorization "Bearer $ADMIN_TOKEN_FROM_YOUR_SECRETS";
+    proxy_pass http://127.0.0.1:8080;
+}
+```
+
+Any client that can set a header works without a proxy. The JSON API is the
+intended interface for automation:
+
+```sh
+curl -H "authorization: Bearer $ADMIN_API_TOKEN" \
+     https://authz.example.com/admin/v1/principals
+
+curl -H "authorization: Bearer $ADMIN_API_TOKEN" \
+     -H 'content-type: application/json' \
+     -d '{"display_name":"Ada Lovelace","email":"ada@example.com"}' \
+     https://authz.example.com/admin/v1/principals
+
+curl -H "authorization: Bearer $ADMIN_API_TOKEN" \
+     -H 'content-type: application/json' \
+     -d '{"role":"writer","resource_pattern":"urc-*","principal_kind":"user","principal_id":"<id>"}' \
+     https://authz.example.com/admin/v1/grants
+```
+
+### What the surface refuses, and why it matters
+
+Three checks exist to stop a grant that would look correct in a listing and
+authorize nothing, forever:
+
+- **`principal_kind` must match the principal.** The policy engine derives
+  the kind it matches on from the principal row's own
+  `is_service_account`, so a binding recorded as `user` against a service
+  account is inert. Refused with 400.
+- **`resource_pattern` is the literal `urc-*` or one specific `urc-<id>`.**
+  Nothing else is a pattern. `urc-abc*` would be stored as a resource id
+  that can never exist, so it is refused rather than accepted as a prefix
+  glob this product does not implement.
+- **The principal or group must exist.** `role_bindings.principal_id` is
+  polymorphic and cannot carry a foreign key, so this is checked here.
+
+Creates that change nothing are reported (`409`) rather than swallowed, and
+every list response is bounded (500 rows) with an explicit `truncated` flag.
+See `tasks.md` for what this surface deliberately does not do.
 
 ## `REBAC_SERVICE_TOKEN`: what it closes, and what it honestly does not
 

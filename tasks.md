@@ -564,9 +564,21 @@ already-issued AuthZ token still works until its short TTL expires
 - [ ] SP metadata endpoint, ACS with signature + condition + replay
       validation, SP-initiated and IdP-initiated, group attribute mapping.
       Behind the `saml` cargo feature (see `docs/architecture.md`).
-- [ ] Admin REST API `/admin/v1` for users, groups, roles, bindings, api
+- [~] Admin REST API `/admin/v1` for users, groups, roles, bindings, api
       keys, idp connections.
-- [ ] Minimal admin web UI (optional, can slip to a later phase).
+      [verified-e2e] for users (principals), groups + membership, resources,
+      roles (list only) and role bindings -- see the "ADMIN SURFACE" section
+      below for the full writeup, the proof, and the explicit list of what
+      it does NOT do. Still `[~]`, not `[x]`: **api keys and idp connections
+      are not covered**, because neither exists yet in this product (there
+      is no `api_keys` table and no `idp_connections` table -- IdPs are
+      configured through `OIDC_*` env vars, and
+      `ExchangeAPIKeyForUserToken` is still `Status::unimplemented`).
+      Exposing CRUD for tables nothing reads would be worse than not
+      exposing it.
+- [x] Minimal admin web UI (optional, can slip to a later phase).
+      [verified-e2e] `/admin/ui`, server-rendered from
+      `crates/lore-authz-server/src/admin/panel.rs`. See below.
 
 **Phase 2 proof**: SAML conformance against Keycloak-as-SAML-IdP in CI,
 plus one real Entra ID SAML app. Assert that a signature-stripped assertion
@@ -1328,3 +1340,272 @@ themselves were not changed (only how they are reached: through `&Db`
 instead of `&PgPool`), so Task 1's PHASE 1a behavior is unchanged on
 Postgres, which the identical 20/20 Postgres pass count (same as
 post-Task-1) confirms.
+
+## ADMIN SURFACE - provisioning without a database client (2026-08-08)
+
+The one structural hole in an otherwise working product: every RPC READ
+`principals` / `groups` / `group_members` / `role_bindings`, and nothing
+could WRITE them. `RebacApi::CreateResource` populated `resources` and the
+OIDC login leg could JIT-provision a principal, but a JIT-provisioned
+principal holds no grants -- so the only way to make any of this useful was
+to insert rows by hand with `psql` or the `sqlite3` CLI. This pass closes
+that. Additive only: no existing RPC, no OIDC/session logic, and no existing
+claim/JWKS behaviour was changed.
+
+- [x] `ADMIN_API_TOKEN` gate on the ENTIRE `/admin/**` surface, failing
+      closed. [verified-e2e]
+      `crates/lore-authz-server/src/admin/auth.rs`, built on the primitives
+      that were already here rather than new ones: `crate::secret::
+      constant_time_eq` and `crate::secret::strip_bearer`, the same pair
+      `crate::service_auth` uses for `REBAC_SERVICE_TOKEN`. Applied as an
+      axum middleware with `Router::layer` (NOT `route_layer`) so it also
+      covers the admin router's own 404 fallback -- an unauthenticated
+      caller cannot map which admin paths exist by probing 404 vs 401.
+      FAIL CLOSED, no bypass: unset token, empty token, missing header,
+      empty header and wrong value ALL deny with an identical `401` (same
+      body, same `www-authenticate: Bearer`), and there is deliberately no
+      dev-mode flag and no way to enable the routes without a token. The
+      distinction an OPERATOR needs (is the surface configured?) is in the
+      startup log in `main.rs`, not in a response an attacker can read.
+      The token is never logged, never echoed, and never rendered into the
+      panel. Header only -- never a URL, never a query parameter, never a
+      cookie.
+- [x] Secrets kept out of any settings dump. [verified-e2e]
+      `Config` no longer `#[derive(Debug)]`: `crates/lore-authz-server/src/
+      config.rs` has a hand-written `Debug` that renders `admin_api_token`,
+      `rebac_service_token` and `oidc_client_secret` as
+      `Some("<redacted>")` / `None`, and `database_url` (which carries a
+      password) as `"<redacted>"`. Nothing in this crate `{:?}`-prints a
+      `Config` today; this exists so that the day something does, it cannot
+      leak. Guarded by `config::tests::
+      config_debug_never_reveals_a_secret_value`, which builds a config with
+      a sentinel in every secret field and asserts the sentinel does not
+      appear.
+- [x] JSON provisioning API under `/admin/v1`. [verified-e2e]
+      `crates/lore-authz-server/src/admin/api.rs`.
+      Principals: `GET|POST /admin/v1/principals`,
+      `GET /admin/v1/principals/{id}`,
+      `POST /admin/v1/principals/{id}/status` (`active`/`suspended`).
+      Create accepts `external_id` / `source` / `subject` so an operator can
+      PRE-PROVISION the identity their IdP or a later SCIM sync will assert,
+      rather than having SCIM create a duplicate.
+      Groups: `GET|POST /admin/v1/groups`,
+      `GET|POST /admin/v1/groups/{id}/members`,
+      `DELETE /admin/v1/groups/{id}/members/{principal_id}`.
+      Resources: `GET|POST /admin/v1/resources`,
+      `DELETE /admin/v1/resources/{resource_id}` (soft delete, same
+      `db::resources::delete_resource` `RebacApi::DeleteResource` calls).
+      Roles: `GET /admin/v1/roles`, list ONLY -- the three advisory roles are
+      seeded by both migration sets and there is no role CRUD.
+      Grants: `GET|POST /admin/v1/grants`, `DELETE /admin/v1/grants/{id}`,
+      supporting both a specific `urc-{id}` pattern and the wildcard
+      `urc-*`. `role` accepts a name or a uuid.
+      Wire shapes are declared explicitly rather than serializing
+      `lore_authz_core::model::Principal`, because that type's `status`
+      serializes as `"Active"` while the value this API ACCEPTS and the
+      database stores is `"active"` -- an API whose output cannot be fed
+      back into its own input is a bug generator. Asserted by a round trip
+      in `admin_creates_and_reads_back_every_entity`.
+- [x] Server-rendered HTML panel at `/admin/ui`, in the same binary.
+      [verified-e2e] `crates/lore-authz-server/src/admin/panel.rs`. Lists
+      principals, groups (with members), resources, roles and grants, with
+      forms to create each and to grant/revoke, plus per-row
+      suspend/activate, remove-member, delete-resource and revoke-grant
+      buttons. No SPA, no JavaScript, no node toolchain, no separate build
+      step, no external asset of any kind -- `format!`-ed HTML with a small
+      inline stylesheet, for the same reason the login pages are
+      self-contained. Every interpolated value is HTML-escaped; a principal
+      whose display name is a `<script>` tag is created through the real API
+      and the rendered page is asserted to carry it escaped, on both
+      backends (`the_admin_panel_renders_what_it_manages_and_escapes_
+      operator_text`). That matters more here than on a public page: the
+      panel is opened by exactly the person holding the admin token.
+      Successful form POSTs answer `303` to `/admin/ui?msg=<code>` where the
+      code is looked up in a FIXED table (an unknown code renders nothing),
+      so nothing typed by anyone is ever reflected out of a query string
+      into the page, and a refresh re-runs a GET rather than the create. A
+      FAILED POST re-renders in place with the error and the error's own
+      status code.
+- [x] Reused the existing data layer, extended in the same style.
+      [verified-e2e] New functions live beside the ones already there, with
+      the same `Db`-variant dispatch and the same SQLite conventions
+      (canonical-string uuids, plain `?` placeholders, explicit
+      `Uuid::parse_str` at the boundary): `db::principals::
+      {insert_admin_principal, list_principals, find_principal,
+      set_principal_status}`, `db::groups::{insert_group_with_description,
+      list_groups, list_group_members, group_exists, remove_member}`,
+      `db::resources::list_resources`, `db::permissions::{create_grant,
+      delete_grant, list_grants, list_roles}`.
+      Deduplications rather than parallel copies: the existing
+      `db::permissions::grant` now delegates to `create_grant`, so there is
+      ONE role-binding insert statement in this codebase; the admin surface
+      validates a resource id with `grpc::validate_new_resource_id` (made
+      `pub`, body unchanged), the exact function `RebacApi::CreateResource`
+      uses; and `strip_bearer`, which had two byte-identical private copies
+      (`caller.rs`, `service_auth.rs`), moved to `crate::secret` and is now
+      shared by all three call sites -- the same reasoning the earlier pass
+      applied to `constant_time_eq`.
+      `db::resources::list_resource_ids_with_prefix` was deliberately NOT
+      given an "include deleted" flag: it is an AUTHORIZATION input, and a
+      boolean between an authorization path and the rows it may consider is
+      exactly the parameter that gets passed wrong once.
+- [x] Validation that prevents SILENTLY WRONG grants, not just malformed
+      ones. [verified-e2e] `crates/lore-authz-server/src/admin/ops.rs`, and
+      this is the part that earns its tests:
+      1. `principal_kind` must agree with the principal's own
+         `is_service_account`. `resolve_resource_permissions` derives the
+         kind it matches on from the PRINCIPAL ROW, so a binding recorded as
+         `user` against a service account matches nothing, ever, while
+         looking perfectly correct in a listing.
+      2. `resource_pattern` must be the exact literal `urc-*` or a
+         well-formed `urc-<id>`. The policy engine treats only the exact
+         sentinel as a wildcard, so a plausible `urc-abc*` is not a prefix
+         glob -- it is a binding to a resource id that cannot exist.
+      3. The principal or group must EXIST.
+         `role_bindings.principal_id` is polymorphic and cannot carry a
+         foreign key (the migration says so in as many words: "validated at
+         the application layer"). This is that layer.
+      None of the three can be enforced by a database constraint, which is
+      why each is tested against a real database on both backends.
+- [x] Creates that change nothing are REPORTED, not swallowed.
+      [verified-e2e] A duplicate group name, a resource id already
+      registered, and a second principal with the same `(source, subject)`
+      all answer `409`; a re-grant answers `200` (with the existing binding's
+      id) instead of `201`, so an operator can tell "already there" from
+      "created" without diffing a list. An admin API that silently no-ops
+      leaves an operator believing they provisioned something they did not.
+- [x] 15 new shared test bodies, run against BOTH backends (30 executions),
+      all passing. [verified-e2e] Added to the SHARED
+      `tests/authz_suite/mod.rs` so Postgres and SQLite cannot drift, with
+      one-line wrappers in `tests/postgres_backed.rs` and
+      `tests/sqlite_backed.rs`. They drive the REAL axum router bound to a
+      REAL ephemeral socket with a REAL HTTP client against a REAL database
+      -- no handler is called directly, because the thing most worth proving
+      about an admin surface is that its gate is on the wire.
+      `admin_denies_every_route_without_a_bearer_token`,
+      `admin_denies_every_route_with_a_wrong_bearer_token` (including a
+      strict PREFIX of the real token, which a naive `starts_with` would
+      accept),
+      `admin_denies_every_route_when_no_admin_token_is_configured` (the
+      fail-closed case: `None` AND `Some("")` configured, crossed with
+      no/right/empty token presented -- 3 x 28 routes x 2 configurations),
+      `admin_creates_and_reads_back_every_entity`,
+      `a_grant_created_through_the_admin_api_is_honoured_by_check_user_
+      permission`,
+      `a_wildcard_grant_created_through_the_admin_api_is_expanded_by_lookup_
+      user_permissions`,
+      `revoking_a_grant_through_the_admin_api_denies_the_next_check`,
+      `admin_group_membership_grants_and_revokes_inherited_access`,
+      `admin_suspending_a_principal_denies_the_next_check`,
+      `admin_deleting_a_resource_denies_the_next_check`,
+      `admin_refuses_a_grant_whose_principal_kind_disagrees_with_the_
+      principal`,
+      `admin_refuses_an_unsupported_resource_pattern_and_an_unknown_
+      principal`,
+      `admin_reports_duplicates_instead_of_silently_doing_nothing`,
+      `the_admin_panel_renders_what_it_manages_and_escapes_operator_text`,
+      `admin_forms_create_and_revoke_through_the_same_operations_as_the_api`.
+      Plus 17 new unit tests: 9 in `admin::auth`, 4 in `admin::ops`, 2 in
+      `admin::panel`, 1 in `config` (the secret-redaction guard) and 1 in
+      `secret` (the shared `strip_bearer`).
+      **The one that matters most**: everything in
+      `a_grant_created_through_the_admin_api_is_honoured_by_check_user_
+      permission` is provisioned over HTTP through the admin API, and the
+      assertion is made through the real gRPC `CheckUserPermission` and
+      `LookupUserPermissions` handlers. A parallel universe -- a second
+      table, a second connection, a stale cache -- fails there and nowhere
+      else. It also asserts the NEGATIVE first (principal exists, resource
+      exists, no grant -> denied), so a check that always allowed could not
+      pass it.
+
+**What the admin surface does NOT do** (stated rather than discovered
+later):
+
+- **No api-key or IdP-connection management**, despite the Phase 2 task line
+  naming both. Neither exists in this product: there is no `api_keys` table,
+  `ExchangeAPIKeyForUserToken` is still `Status::unimplemented`, and IdPs are
+  configured through `OIDC_*` environment variables, not a table. CRUD over
+  tables nothing reads would be theatre.
+- **No pagination and no filtering/search.** Every list is capped at 500 rows
+  with an explicit `truncated` flag in the JSON and a visible note in the
+  panel. Honest, but a deployment with more than 500 principals cannot page
+  past the first 500 through this surface.
+- **No hard delete** of a principal or a group, and `deprovisioned` cannot be
+  SET (only `active`/`suspended`). Suspension is reversible and leaves the
+  row; a delete cascading `group_members` and `role_bindings` out of
+  existence is not, and nothing in this product distinguishes
+  `deprovisioned` from `suspended` yet.
+- **No audit log.** Who created which grant, and when, is not recorded
+  anywhere -- `audit_log` is still Phase 1/3 and does not exist. For a
+  surface that mints authority this is the most significant gap on this
+  list.
+- **No admin identity.** Everyone who holds `ADMIN_API_TOKEN` is the same
+  anonymous caller, with all of it. There is no per-operator credential, no
+  scoping (read-only vs write), and no rotation mechanism beyond changing
+  the setting and restarting. This is the same trade `REBAC_SERVICE_TOKEN`
+  makes, for the same reason (the caller has no `principals` row to resolve
+  to), but the blast radius here is larger.
+- **No rate limiting or brute-force lockout** on the gate. The token is
+  expected to be high-entropy and the path is expected to be restricted at a
+  reverse proxy; neither is enforced by this service.
+- **The panel needs a header-injecting proxy to be usable in a browser.**
+  Every `/admin` route requires the `Authorization` header and there is no
+  cookie or login form, deliberately -- adding a second, weaker credential
+  path into a surface that can mint authority is not worth saving a line of
+  proxy configuration. A worked nginx example is in
+  `docs/configuration.md`. Any client that can set a header (curl, a script)
+  needs nothing extra.
+- **`.env.example` NOT updated** with `ADMIN_API_TOKEN`: the tooling this
+  pass ran under blocks all writes to `.env*` paths, including this
+  committed placeholders-only template (the same block the PHASE 1b pass
+  hit). Nothing was worked around. Whoever picks this up next should add
+  `ADMIN_API_TOKEN=CHANGE_ME` with the fail-closed note from
+  `docs/configuration.md`'s `ADMIN_API_TOKEN` row.
+- **No `lore` CLI or `lore-server` involvement.** This surface was proven
+  against this service's own gRPC handlers and its own HTTP router, not
+  against a running lore-server. The Phase 0 exit gate is unchanged by this
+  work.
+
+**Documentation updated**: `docs/configuration.md` (the `ADMIN_API_TOKEN`
+row plus a dedicated section: what the surface is, why the token is a root
+credential, the fail-closed rule, a worked reverse-proxy example, `curl`
+recipes, and what the surface refuses and why), `docs/data-model.md` (a new
+"Who writes these tables" section, since reading them was implemented long
+before writing them), `README.md` (a "Provisioning" section naming the admin
+surface as the only supported way to create a grant), and this file.
+
+**On `README.md`'s bootstrap procedure**: there is none to retire. The task
+that commissioned this work expected `README.md` to document bootstrapping
+by direct SQLite inserts; it does not, and never did -- a repo-wide grep for
+`INSERT INTO` / `sqlite3` across every `.md` file in the repository finds
+exactly one hit, and it is the crate name `libsqlite3-sys` in this file. The hack was real but undocumented (it
+lived in operators' shell history, not in the repo), so nothing was deleted.
+What CAN now be stated: creating a principal, a group, a membership, a
+resource and a grant, and revoking each, all work through the admin API and
+are proven end to end against both backends -- so direct SQL is no longer
+needed for any provisioning operation this product supports.
+
+**PROOF (all four checks run for real in the pinned build image
+`docker/Dockerfile.build`; the Postgres- and IdP-backed tests via `docker
+compose -f docker-compose.test.yml run --rm --build tests`, which brings up
+a real `postgres:16-alpine` AND a real `ghcr.io/dexidp/dex:v2.44.0` and runs
+the FULL `cargo test --workspace`):**
+
+- `cargo build --workspace`: clean, 0 warnings, `Finished dev profile`,
+  exit 0.
+- `cargo fmt --all -- --check`: clean, exit 0 (one `cargo fmt --all` pass
+  applied first; line-wrap only, no logic changed).
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean, exit 0.
+  One real fix along the way: `verify_admin_caller` originally returned
+  `Result<(), ()>`, which trips `clippy::result_unit_err`; it now returns a
+  dedicated field-less `Denied` type -- which reads better anyway, since the
+  point is that the denial carries no detail.
+- `cargo test --workspace`: **197 passed, 0 failed** (was 150 before this
+  pass), compose exit 0:
+  - `lore-authz-core` / `lore-authz-proto`: 0 tests (unchanged).
+  - `lore-authz-server` unit tests: **77** (was 60).
+  - `tests/lore_compat.rs`: **4**, unchanged.
+  - `tests/oidc_flow.rs`: **16**, unchanged, against a REAL OIDC provider.
+  - `tests/postgres_backed.rs`: **50** (was 35), real Postgres 16.
+  - `tests/sqlite_backed.rs`: **50** (was 35) -- the EXACT SAME 50 names,
+    same shared bodies, `Backend::Sqlite`.

@@ -62,6 +62,11 @@ pub struct AppState {
     /// path where an unconfigured provider produces a completed login.
     pub oidc: Option<Arc<OidcProvider>>,
     pub oidc_login: OidcLoginSettings,
+    /// `ADMIN_API_TOKEN`: the shared secret gating every `/admin/**` route.
+    /// `None` (unset or empty) DENIES the entire admin surface -- see
+    /// `crate::admin::auth`. `Arc` so cloning this state per request does not
+    /// copy the secret.
+    pub admin_api_token: Option<Arc<String>>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -79,8 +84,14 @@ pub fn router(state: AppState) -> Router {
         // Phase 2: SAML 2.0 assertion consumer service + SP metadata.
         .route("/saml/acs", post(unimplemented))
         .route("/saml/metadata", get(unimplemented))
-        // Phase 2: admin REST API.
-        .route("/admin/v1/{*rest}", get(unimplemented))
+        // The admin surface: the `/admin/v1` provisioning API and the
+        // `/admin/ui` panel, in one sub-router so a reverse proxy can
+        // restrict this deployment's whole administrative surface by the
+        // single path prefix `/admin`. EVERY route under it is gated on
+        // `ADMIN_API_TOKEN` and fails closed when that is unset -- see
+        // `crate::admin` and `crate::admin::auth`. This replaces the
+        // `/admin/v1/{*rest}` 501 stub that stood here.
+        .nest("/admin", crate::admin::router(state.clone()))
         // Phase 3: SCIM 2.0.
         .route("/scim/v2/{*rest}", get(unimplemented))
         .route("/healthz", get(healthz))
@@ -292,6 +303,7 @@ mod tests {
             db: None,
             oidc: None,
             oidc_login: OidcLoginSettings::default(),
+            admin_api_token: None,
         }
     }
 
@@ -384,6 +396,7 @@ mod tests {
             db: Some(Arc::new(db)),
             oidc: Some(Arc::new(provider)),
             oidc_login: OidcLoginSettings::default(),
+            admin_api_token: None,
         };
 
         let response = login_page(State(state), Path(login_code)).await;
@@ -432,6 +445,7 @@ mod tests {
             db: Some(Arc::new(db)),
             oidc: Some(Arc::new(provider)),
             oidc_login: OidcLoginSettings::default(),
+            admin_api_token: None,
         };
 
         let response = oidc_callback(

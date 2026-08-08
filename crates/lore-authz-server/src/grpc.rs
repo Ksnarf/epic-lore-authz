@@ -583,7 +583,14 @@ impl RebacApiService {
 /// real resource row. Letting it through `CreateResource` would create a
 /// resource whose id is indistinguishable from the wildcard pattern to any
 /// code that compares the two as plain strings.
-fn validate_new_resource_id(resource_id: &str) -> Result<(), Status> {
+///
+/// `pub` so `crate::admin` validates an operator-supplied `resource_id` (and,
+/// via `crate::admin::ops::validate_resource_pattern`, an operator-supplied
+/// role-binding pattern) against THIS function rather than a second copy of
+/// the same rules. The `Status` return type is a little odd for an HTTP
+/// caller, but a duplicated validation rule is worse than an odd error type:
+/// `crate::admin` maps the message onto a 400.
+pub fn validate_new_resource_id(resource_id: &str) -> Result<(), Status> {
     if resource_id.is_empty() {
         return Err(Status::invalid_argument("resource_id must not be empty"));
     }

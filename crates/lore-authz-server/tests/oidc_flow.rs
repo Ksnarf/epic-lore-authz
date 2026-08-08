@@ -180,6 +180,11 @@ impl Harness {
                 db: Some(db.clone()),
                 oidc: Some(provider.clone()),
                 oidc_login: login_settings.clone(),
+                // This suite exercises the login flow, not the admin
+                // surface. `None` means every /admin route on the router it
+                // binds denies -- the fail-closed default, asserted directly
+                // in `tests/authz_suite/mod.rs`.
+                admin_api_token: None,
             },
             db,
             provider,

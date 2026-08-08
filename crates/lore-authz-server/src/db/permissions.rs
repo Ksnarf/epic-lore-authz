@@ -79,13 +79,19 @@ fn sqlite_placeholders(n: usize) -> String {
     std::iter::repeat_n("?", n).collect::<Vec<_>>().join(",")
 }
 
+/// The three `principal_kind` values the `role_bindings` CHECK constraint
+/// accepts on both backends. Exported so `crate::admin` validates against the
+/// same list the database enforces, rather than a second copy that could
+/// drift from it.
+pub const PRINCIPAL_KINDS: [&str; 3] = ["user", "service_account", "group"];
+
 /// Grants `role_id` to a principal (or group), either for one specific
 /// `resource_pattern` (e.g. `"urc-abc123"`) or, via `WILDCARD_RESOURCE_
 /// PATTERN`, for every `urc-*` resource. `principal_kind` must be one of
-/// `"user"`, `"service_account"`, `"group"` (matches the `role_bindings`
-/// CHECK constraint on both backends). Used only by `tests/` today -- see
-/// `db::principals::insert_principal`'s doc comment for why this is a plain
-/// `pub fn` rather than `#[cfg(test)]`-gated.
+/// `PRINCIPAL_KINDS` (matches the `role_bindings` CHECK constraint on both
+/// backends). Used by `tests/` and, through `create_grant`, by
+/// `crate::admin` -- see `db::principals::insert_principal`'s doc comment for
+/// why this is a plain `pub fn` rather than `#[cfg(test)]`-gated.
 pub async fn grant(
     db: &Db,
     role_id: Uuid,
@@ -93,39 +99,295 @@ pub async fn grant(
     principal_kind: &str,
     principal_id: Uuid,
 ) -> Result<(), sqlx::Error> {
+    // Delegates to `create_grant` so there is ONE insert statement for a
+    // role binding in this codebase, not two that could drift in their
+    // conflict handling. The returned outcome is what the admin surface
+    // reports to an operator; this older signature does not need it.
+    create_grant(db, role_id, resource_pattern, principal_kind, principal_id)
+        .await
+        .map(|_| ())
+}
+
+/// Whether a grant was newly created, and its id either way. `AlreadyExists`
+/// carries the EXISTING binding's id rather than erroring, because
+/// re-granting something already granted is not a failure -- but the admin
+/// surface still tells the operator which of the two happened instead of
+/// reporting a create that did not create anything.
+pub enum CreateGrantOutcome {
+    Created(Uuid),
+    AlreadyExists(Uuid),
+}
+
+impl CreateGrantOutcome {
+    pub fn id(&self) -> Uuid {
+        match self {
+            CreateGrantOutcome::Created(id) | CreateGrantOutcome::AlreadyExists(id) => *id,
+        }
+    }
+}
+
+/// Creates a role binding and reports its id -- the admin surface needs the
+/// id back so the operator can revoke exactly this binding later
+/// (`delete_grant`).
+///
+/// This function performs NO validation of its own: `role_id` is FK-enforced,
+/// but `principal_kind`/`principal_id` are the polymorphic pair the schema
+/// explicitly cannot constrain (see `migrations/0001_identities_resources_
+/// grants.sql`), and `resource_pattern` is a plain string. `crate::admin::ops`
+/// is where those are checked before this is called; nothing else in this
+/// crate creates a binding from untrusted input.
+pub async fn create_grant(
+    db: &Db,
+    role_id: Uuid,
+    resource_pattern: &str,
+    principal_kind: &str,
+    principal_id: Uuid,
+) -> Result<CreateGrantOutcome, sqlx::Error> {
+    let id = Uuid::new_v4();
     match db {
         Db::Postgres(handle) => {
-            sqlx::query(
+            let inserted: Option<(Uuid,)> = sqlx::query_as(
                 "INSERT INTO role_bindings (id, role_id, resource_pattern, principal_kind, \
                  principal_id) VALUES ($1, $2, $3, $4, $5) \
                  ON CONFLICT (role_id, resource_pattern, principal_kind, principal_id) DO \
-                 NOTHING",
+                 NOTHING \
+                 RETURNING id",
             )
-            .bind(Uuid::new_v4())
+            .bind(id)
             .bind(role_id)
             .bind(resource_pattern)
             .bind(principal_kind)
             .bind(principal_id)
-            .execute(&handle.pool)
+            .fetch_optional(&handle.pool)
             .await?;
+            if inserted.is_some() {
+                return Ok(CreateGrantOutcome::Created(id));
+            }
+
+            let existing: Option<(Uuid,)> = sqlx::query_as(
+                "SELECT id FROM role_bindings WHERE role_id = $1 AND resource_pattern = $2 \
+                 AND principal_kind = $3 AND principal_id = $4",
+            )
+            .bind(role_id)
+            .bind(resource_pattern)
+            .bind(principal_kind)
+            .bind(principal_id)
+            .fetch_optional(&handle.pool)
+            .await?;
+            // `None` here would mean the row vanished between the two
+            // statements (a concurrent revoke). Reporting the id we tried to
+            // insert would be a lie, so report the conflict against the id
+            // the operator asked about -- `AlreadyExists` with a stale id is
+            // still honest about the outcome, and the list endpoint is the
+            // source of truth for what exists.
+            Ok(CreateGrantOutcome::AlreadyExists(
+                existing.map(|(id,)| id).unwrap_or(id),
+            ))
         }
         Db::Sqlite(handle) => {
-            sqlx::query(
+            let inserted: Option<(String,)> = sqlx::query_as(
                 "INSERT INTO role_bindings (id, role_id, resource_pattern, principal_kind, \
                  principal_id) VALUES (?, ?, ?, ?, ?) \
                  ON CONFLICT (role_id, resource_pattern, principal_kind, principal_id) DO \
-                 NOTHING",
+                 NOTHING \
+                 RETURNING id",
             )
-            .bind(Uuid::new_v4().to_string())
+            .bind(id.to_string())
             .bind(role_id.to_string())
             .bind(resource_pattern)
             .bind(principal_kind)
             .bind(principal_id.to_string())
-            .execute(&handle.pool)
+            .fetch_optional(&handle.pool)
             .await?;
+            if inserted.is_some() {
+                return Ok(CreateGrantOutcome::Created(id));
+            }
+
+            let existing: Option<(String,)> = sqlx::query_as(
+                "SELECT id FROM role_bindings WHERE role_id = ? AND resource_pattern = ? \
+                 AND principal_kind = ? AND principal_id = ?",
+            )
+            .bind(role_id.to_string())
+            .bind(resource_pattern)
+            .bind(principal_kind)
+            .bind(principal_id.to_string())
+            .fetch_optional(&handle.pool)
+            .await?;
+            Ok(CreateGrantOutcome::AlreadyExists(match existing {
+                Some((raw,)) => parse_id("role_bindings.id", &raw)?,
+                None => id,
+            }))
         }
     }
-    Ok(())
+}
+
+/// Revokes exactly one role binding by id, returning whether a row was
+/// actually deleted (`false` = no such binding, reported as a 404 by the
+/// admin surface rather than a silent success).
+///
+/// The next `CheckUserPermission` / `LookupUserPermissions` / token exchange
+/// stops honoring it, because `resolve_resource_permissions` re-reads
+/// `role_bindings` on every request. An AuthZ token already issued keeps its
+/// `resources` claim until it expires -- the stateless-revocation window
+/// documented in `docs/protocol-notes.md`, unchanged by this surface.
+pub async fn delete_grant(db: &Db, id: Uuid) -> Result<bool, sqlx::Error> {
+    let rows_affected = match db {
+        Db::Postgres(handle) => sqlx::query("DELETE FROM role_bindings WHERE id = $1")
+            .bind(id)
+            .execute(&handle.pool)
+            .await?
+            .rows_affected(),
+        Db::Sqlite(handle) => sqlx::query("DELETE FROM role_bindings WHERE id = ?")
+            .bind(id.to_string())
+            .execute(&handle.pool)
+            .await?
+            .rows_affected(),
+    };
+    Ok(rows_affected == 1)
+}
+
+/// A role binding as the admin surface lists it, with the role's NAME joined
+/// in: an operator revoking a grant needs to see "admin on urc-*", not a bare
+/// pair of UUIDs.
+#[derive(Debug, Clone)]
+pub struct GrantSummary {
+    pub id: Uuid,
+    pub role_id: Uuid,
+    pub role_name: String,
+    pub resource_pattern: String,
+    pub principal_kind: String,
+    pub principal_id: Uuid,
+}
+
+/// Every role binding, for the admin list view. Ordered by
+/// `(resource_pattern, role_name, principal_kind, principal_id)` so the
+/// ordering is total and identical on both backends, and bounded by `limit`.
+pub async fn list_grants(db: &Db, limit: i64) -> Result<Vec<GrantSummary>, sqlx::Error> {
+    const ORDER_BY: &str =
+        "ORDER BY rb.resource_pattern, r.name, rb.principal_kind, rb.principal_id";
+    match db {
+        Db::Postgres(handle) => {
+            let rows: Vec<(Uuid, Uuid, String, String, String, Uuid)> = sqlx::query_as(&format!(
+                "SELECT rb.id, rb.role_id, r.name, rb.resource_pattern, rb.principal_kind, \
+                 rb.principal_id FROM role_bindings rb JOIN roles r ON r.id = rb.role_id \
+                 {ORDER_BY} LIMIT $1"
+            ))
+            .bind(limit)
+            .fetch_all(&handle.pool)
+            .await?;
+            Ok(rows
+                .into_iter()
+                .map(
+                    |(id, role_id, role_name, resource_pattern, principal_kind, principal_id)| {
+                        GrantSummary {
+                            id,
+                            role_id,
+                            role_name,
+                            resource_pattern,
+                            principal_kind,
+                            principal_id,
+                        }
+                    },
+                )
+                .collect())
+        }
+        Db::Sqlite(handle) => {
+            let rows: Vec<(String, String, String, String, String, String)> =
+                sqlx::query_as(&format!(
+                    "SELECT rb.id, rb.role_id, r.name, rb.resource_pattern, rb.principal_kind, \
+                     rb.principal_id FROM role_bindings rb JOIN roles r ON r.id = rb.role_id \
+                     {ORDER_BY} LIMIT ?"
+                ))
+                .bind(limit)
+                .fetch_all(&handle.pool)
+                .await?;
+            rows.into_iter()
+                .map(
+                    |(id, role_id, role_name, resource_pattern, principal_kind, principal_id)| {
+                        Ok(GrantSummary {
+                            id: parse_id("role_bindings.id", &id)?,
+                            role_id: parse_id("role_bindings.role_id", &role_id)?,
+                            role_name,
+                            resource_pattern,
+                            principal_kind,
+                            principal_id: parse_id("role_bindings.principal_id", &principal_id)?,
+                        })
+                    },
+                )
+                .collect()
+        }
+    }
+}
+
+/// A role and its advisory permission strings.
+#[derive(Debug, Clone)]
+pub struct RoleSummary {
+    pub id: Uuid,
+    pub name: String,
+    pub permissions: Vec<String>,
+}
+
+/// The built-in roles, seeded by BOTH migration sets. Read-only by design:
+/// there is no role CRUD anywhere in this product, and the admin surface
+/// exposes only this list (see `crate::admin`).
+///
+/// The two backends store `permissions` differently -- a Postgres `text[]`
+/// column versus a SQLite `role_permissions` join table (see this module's
+/// doc comment) -- and both paths sort the permission strings in Rust,
+/// because SQLite's `GROUP_CONCAT` does not promise an order and an
+/// unstable list would make the two backends' output differ for no reason.
+pub async fn list_roles(db: &Db) -> Result<Vec<RoleSummary>, sqlx::Error> {
+    let mut roles: Vec<RoleSummary> = match db {
+        Db::Postgres(handle) => {
+            let rows: Vec<(Uuid, String, Vec<String>)> =
+                sqlx::query_as("SELECT id, name, permissions FROM roles ORDER BY name")
+                    .fetch_all(&handle.pool)
+                    .await?;
+            rows.into_iter()
+                .map(|(id, name, permissions)| RoleSummary {
+                    id,
+                    name,
+                    permissions,
+                })
+                .collect()
+        }
+        Db::Sqlite(handle) => {
+            let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
+                "SELECT r.id, r.name, GROUP_CONCAT(rp.permission) \
+                 FROM roles r LEFT JOIN role_permissions rp ON rp.role_id = r.id \
+                 GROUP BY r.id, r.name ORDER BY r.name",
+            )
+            .fetch_all(&handle.pool)
+            .await?;
+            rows.into_iter()
+                .map(|(id, name, permissions)| {
+                    Ok(RoleSummary {
+                        id: parse_id("roles.id", &id)?,
+                        name,
+                        // LEFT JOIN + GROUP_CONCAT yields NULL, not an empty
+                        // string, for a role with no permissions -- so an
+                        // unwrap_or_default() here would produce `[""]`
+                        // rather than `[]`.
+                        permissions: permissions
+                            .map(|joined| joined.split(',').map(str::to_string).collect())
+                            .unwrap_or_default(),
+                    })
+                })
+                .collect::<Result<Vec<_>, sqlx::Error>>()?
+        }
+    };
+    for role in &mut roles {
+        role.permissions.sort();
+    }
+    Ok(roles)
+}
+
+/// Parses a UUID stored as SQLite TEXT -- see
+/// `db::principals::sqlite_row_into_principal`'s doc comment for why a
+/// malformed value maps to `sqlx::Error::Decode`.
+fn parse_id(column: &str, raw: &str) -> Result<Uuid, sqlx::Error> {
+    Uuid::parse_str(raw)
+        .map_err(|err| sqlx::Error::Decode(format!("{column} {raw:?}: {err}").into()))
 }
 
 #[derive(Debug, sqlx::FromRow)]

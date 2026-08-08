@@ -116,6 +116,27 @@ resolve to an `active` row in `principals` denies with
 deprovisioned principals are all treated identically: deny, not "no
 restriction."
 
+## Who writes these tables
+
+Reading them was implemented well before writing them, so it is worth being
+explicit about which component owns each write:
+
+| Table | Written by |
+|---|---|
+| `principals` | The OIDC login leg (JIT provisioning, `crates/lore-authz-server/src/oidc_login.rs`) and the admin surface (`POST /admin/v1/principals`, `POST /admin/v1/principals/{id}/status`). |
+| `groups`, `group_members` | The admin surface only. There is no SCIM group sync yet (Phase 3). |
+| `resources` | `RebacApi::CreateResource`/`DeleteResource`, called by lore-server when a repository is created or deleted -- and the admin surface, for the bring-up case (a repository that predates this service) and for repairing a missing row. Both paths call the same `db::resources` functions and validate the id with the same rule. |
+| `roles` | The migrations, and nothing else. There is no role CRUD anywhere in this product. |
+| `role_bindings` | The admin surface only. This is the table that decides what anyone can see, and until the admin surface existed nothing could write it except a database client. |
+| `auth_sessions` | The login flow (`crates/lore-authz-server/src/login.rs`, `oidc_login.rs`). |
+
+Every admin write goes through `crates/lore-authz-server/src/admin/ops.rs`,
+which is also where the checks a database constraint cannot express live
+(`principal_kind` agreeing with the principal's own `is_service_account`,
+`resource_pattern` being the literal wildcard or a well-formed resource id,
+and the polymorphic `role_bindings.principal_id` actually existing). See
+`docs/configuration.md`'s `ADMIN_API_TOKEN` section.
+
 ## Testing
 
 `crates/lore-authz-server/tests/authz_suite/` defines the shared test

@@ -16,7 +16,7 @@ use std::net::SocketAddr;
 // load-bearing when Phase 1b/2 land. Not dead code in the design; just not
 // all consumed yet.
 #[allow(dead_code)]
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Config {
     /// Postgres connection string. PHASE 1a (see tasks.md): required for
     /// `LookupUserPermissions`, `CheckUserPermission`, and
@@ -124,6 +124,68 @@ pub struct Config {
     /// `crate::service_auth::verify_rebac_caller`. This is a deliberate
     /// fail-closed default, not a missing feature.
     pub rebac_service_token: Option<String>,
+
+    /// Shared secret gating the ENTIRE admin surface (`/admin/**` on the HTTP
+    /// listener: the `/admin/v1` provisioning API and the `/admin/ui` panel)
+    /// -- see `crate::admin` for the mechanism and `docs/configuration.md`
+    /// for the deployment guidance.
+    ///
+    /// `None` (unset, or set to the empty string -- `env_var_opt` collapses
+    /// the two) means every admin request is DENIED. That is the whole
+    /// design: this surface can MINT AUTHORITY (create a principal, bind it
+    /// to `urc-*` with the `admin` role), so an unconfigured gate that
+    /// defaulted to open would be strictly worse than any bug this project
+    /// has fixed. There is deliberately no bypass flag, no "dev mode", and
+    /// no way to enable the routes without a token: see
+    /// `crate::admin::auth::verify_admin_caller`.
+    pub admin_api_token: Option<String>,
+}
+
+/// Hand-written so a `Config` can never carry a secret into a log line, a
+/// panic message, or an `anyhow` context string. Every secret-valued field is
+/// rendered as `Some("<redacted>")` / `None` -- the PRESENCE of a value is
+/// operationally important (it is what decides whether a gate denies
+/// everything) and is not itself sensitive; the value never is.
+///
+/// Nothing in this crate currently `{:?}`-prints a `Config`, and this exists
+/// so that the day something does, it cannot leak. `config_debug_never_
+/// reveals_a_secret_value` in this module's tests is the guard.
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        /// Renders as `Some("<redacted>")` / `None`, never the value: the
+        /// `Option` is kept (so `Debug` prints the presence) and only its
+        /// CONTENT is replaced.
+        fn redacted(value: &Option<String>) -> Option<&'static str> {
+            value.as_ref().map(|_| "<redacted>")
+        }
+
+        f.debug_struct("Config")
+            .field("database_url", &"<redacted>")
+            .field("db_schema", &self.db_schema)
+            .field("jwt_issuer", &self.jwt_issuer)
+            .field("jwt_audience", &self.jwt_audience)
+            .field("token_env", &self.token_env)
+            .field("authn_token_ttl_secs", &self.authn_token_ttl_secs)
+            .field("authz_token_ttl_secs", &self.authz_token_ttl_secs)
+            .field("token_idp", &self.token_idp)
+            .field("auth_session_ttl_secs", &self.auth_session_ttl_secs)
+            .field("public_base_url", &self.public_base_url)
+            .field("signing_key_source", &self.signing_key_source)
+            .field("jwks_path", &self.jwks_path)
+            .field("grpc_listen_addr", &self.grpc_listen_addr)
+            .field("http_listen_addr", &self.http_listen_addr)
+            .field("oidc_issuer_url", &self.oidc_issuer_url)
+            .field("oidc_client_id", &self.oidc_client_id)
+            .field("oidc_client_secret", &redacted(&self.oidc_client_secret))
+            .field("oidc_redirect_url", &self.oidc_redirect_url)
+            .field("oidc_scopes", &self.oidc_scopes)
+            .field("oidc_jit_provisioning", &self.oidc_jit_provisioning)
+            .field("saml_sp_entity_id", &self.saml_sp_entity_id)
+            .field("saml_idp_metadata_url", &self.saml_idp_metadata_url)
+            .field("rebac_service_token", &redacted(&self.rebac_service_token))
+            .field("admin_api_token", &redacted(&self.admin_api_token))
+            .finish()
+    }
 }
 
 fn env_var(key: &str) -> Result<String, anyhow::Error> {
@@ -232,6 +294,12 @@ impl Config {
             saml_sp_entity_id: env_var_opt("SAML_SP_ENTITY_ID"),
             saml_idp_metadata_url: env_var_opt("SAML_IDP_METADATA_URL"),
             rebac_service_token: env_var_opt("REBAC_SERVICE_TOKEN"),
+            // `env_var_opt` filters the empty string out to `None`, which is
+            // exactly the fail-closed reading this gate needs: an operator
+            // who writes `ADMIN_API_TOKEN=` in an env file has NOT configured
+            // an admin surface, and must not get one that accepts an empty
+            // bearer token. See `crate::admin::auth::verify_admin_caller`.
+            admin_api_token: env_var_opt("ADMIN_API_TOKEN"),
         })
     }
 }
@@ -292,5 +360,64 @@ mod tests {
         unsafe { env::set_var(KEY, "flase") };
         assert!(parse_bool_env(KEY, true).is_err());
         unsafe { env::remove_var(KEY) };
+    }
+
+    /// Builds a `Config` by hand (not from the environment, so this test
+    /// races with nothing) with a recognizable sentinel in every
+    /// secret-valued field, and asserts the `Debug` rendering contains NONE
+    /// of them. The admin token is the one that matters most: it can mint
+    /// authority, so a `{:?}` of the config in a log line or a panic message
+    /// would be a credential disclosure.
+    #[test]
+    fn config_debug_never_reveals_a_secret_value() {
+        const SENTINEL: &str = "NEVER-LOG-THIS-VALUE";
+        let config = Config {
+            database_url: format!("postgres://user:{SENTINEL}@db.example.com/postgres"),
+            db_schema: "loreauth".to_string(),
+            jwt_issuer: "https://authz.example.com".to_string(),
+            jwt_audience: vec!["lore.example.com".to_string()],
+            token_env: "test".to_string(),
+            authn_token_ttl_secs: 1,
+            authz_token_ttl_secs: 1,
+            token_idp: "local".to_string(),
+            auth_session_ttl_secs: 1,
+            public_base_url: "https://authz.example.com".to_string(),
+            signing_key_source: "file:///does-not-exist.der".to_string(),
+            jwks_path: "/.well-known/jwks.json".to_string(),
+            grpc_listen_addr: "127.0.0.1:8443".parse().unwrap(),
+            http_listen_addr: "127.0.0.1:8080".parse().unwrap(),
+            oidc_issuer_url: Some("https://idp.example.com".to_string()),
+            oidc_client_id: Some("client".to_string()),
+            oidc_client_secret: Some(SENTINEL.to_string()),
+            oidc_redirect_url: Some("https://authz.example.com/oidc/callback".to_string()),
+            oidc_scopes: "openid".to_string(),
+            oidc_jit_provisioning: true,
+            saml_sp_entity_id: None,
+            saml_idp_metadata_url: None,
+            rebac_service_token: Some(SENTINEL.to_string()),
+            admin_api_token: Some(SENTINEL.to_string()),
+        };
+
+        let rendered = format!("{config:?}");
+        assert!(
+            !rendered.contains(SENTINEL),
+            "a secret leaked into Config's Debug rendering: {rendered}"
+        );
+        // The PRESENCE of each secret is still visible, because "is this
+        // gate configured at all" is the operationally important fact and is
+        // not itself sensitive.
+        assert!(rendered.contains("admin_api_token: Some(\"<redacted>\")"));
+        assert!(rendered.contains("rebac_service_token: Some(\"<redacted>\")"));
+        assert!(rendered.contains("oidc_client_secret: Some(\"<redacted>\")"));
+
+        let unset = Config {
+            admin_api_token: None,
+            rebac_service_token: None,
+            oidc_client_secret: None,
+            ..config
+        };
+        let rendered = format!("{unset:?}");
+        assert!(rendered.contains("admin_api_token: None"));
+        assert!(!rendered.contains(SENTINEL));
     }
 }

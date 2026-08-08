@@ -86,6 +86,30 @@ Then point an unmodified `lore-server` at it:
 - `auth.jwt_issuer` / `auth.jwt_audience` -> matching `JWT_ISSUER` /
   `JWT_AUDIENCE` in this project's config (see `docs/configuration.md`)
 
+## Provisioning: creating principals, groups and grants
+
+A principal that logs in successfully still sees nothing until an operator
+grants it something: provisioning creates an IDENTITY, never an
+AUTHORIZATION. The admin surface is how that grant gets made, and it is the
+only supported way -- writing `role_bindings` rows by hand with a database
+client is not a procedure this project documents.
+
+Set `ADMIN_API_TOKEN` (see `docs/configuration.md`) and the HTTP listener
+serves, under one restrictable path prefix:
+
+- `/admin/v1/...` -- a JSON API: principals, groups and members, resources,
+  grants, and the read-only role list.
+- `/admin/ui` -- a server-rendered HTML panel with the same lists plus forms
+  to create and to grant/revoke. No JavaScript and no build step; it is part
+  of the same binary.
+
+Every route under `/admin` requires `authorization: Bearer <ADMIN_API_TOKEN>`
+and **fails closed**: with the setting unset or empty, every admin request is
+denied, including one presenting a token. There is no bypass flag. Treat the
+token as a root credential -- this surface can bind a principal to `urc-*`
+with the `admin` role -- and restrict `/admin` at your reverse proxy as
+well; `docs/configuration.md` has a worked example.
+
 ## Prebuilt binaries
 
 Every tag matching `v*` builds both binaries below on native `ubuntu-24.04`

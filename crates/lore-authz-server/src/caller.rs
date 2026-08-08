@@ -19,27 +19,13 @@ use serde::Deserialize;
 use tonic::Status;
 use uuid::Uuid;
 
+use crate::secret::strip_bearer;
 use crate::signing::SigningKeyStore;
 
 #[derive(Deserialize)]
 struct SubjectClaim {
     #[serde(rename = "sub")]
     subject: String,
-}
-
-/// Strips a leading `"Bearer "` prefix (matching the lore CLI's own
-/// `set_auth_header` convention), and treats an empty string as "no token
-/// present". Per the fork's `authnz/common.rs::
-/// can_create_request_without_authorization` test, lore-server's own
-/// `create_request_with_authorization` forwards a literal EMPTY string, not
-/// a missing header, when it has nothing to forward on our behalf -- this
-/// must be treated as absent, not as a malformed token.
-fn strip_bearer(raw: &str) -> Option<&str> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    Some(trimmed.strip_prefix("Bearer ").unwrap_or(trimmed))
 }
 
 /// Decodes the caller's `Principal.id` (the `sub` claim) out of a bearer

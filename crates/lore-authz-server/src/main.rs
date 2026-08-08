@@ -102,6 +102,27 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    // The admin surface (/admin/v1 + /admin/ui on the HTTP listener) is
+    // gated on ADMIN_API_TOKEN and fails closed: unset means every admin
+    // request is denied with 401. Logged either way, because "the admin
+    // surface denies everything" and "the admin surface is live" are both
+    // facts an operator must be able to read out of the startup log rather
+    // than discover by probing. The token itself is never logged, and
+    // `Config`'s Debug impl redacts it (see config.rs).
+    let admin_api_token = config.admin_api_token.clone().map(Arc::new);
+    match admin_api_token {
+        Some(_) => info!(
+            "admin surface ENABLED at /admin/v1 (JSON API) and /admin/ui (panel) on the HTTP \
+             listener, gated on ADMIN_API_TOKEN -- restrict the /admin path at your reverse \
+             proxy as well, see docs/configuration.md"
+        ),
+        None => warn!(
+            "ADMIN_API_TOKEN is not set: every /admin request will be DENIED with 401 until it \
+             is configured. Provisioning principals, groups and grants is impossible without \
+             it -- see docs/configuration.md"
+        ),
+    }
+
     // PHASE 1b (see tasks.md): token/session knobs for the login and
     // exchange RPCs. `public_base_url` being empty is a real, denied state,
     // not a benign default -- StartAuthSession refuses to issue a login URL
@@ -208,6 +229,7 @@ async fn main() -> anyhow::Result<()> {
         db: db.clone(),
         oidc,
         oidc_login: oidc_login_settings,
+        admin_api_token,
     };
     let http_server = async {
         let listener = tokio::net::TcpListener::bind(config.http_listen_addr).await?;

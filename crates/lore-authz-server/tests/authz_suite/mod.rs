@@ -1649,3 +1649,1208 @@ pub async fn migrations_are_idempotent(backend: Backend) {
         .await
         .expect("re-running migrations against an already-migrated database");
 }
+
+// =========================================================================
+// ADMIN SURFACE (see crates/lore-authz-server/src/admin/)
+// =========================================================================
+//
+// These run against the REAL axum router bound to a REAL socket, driven by a
+// REAL HTTP client, against a REAL database -- on BOTH backends, like
+// everything else in this file. Nothing here calls a handler function
+// directly, because the thing most worth proving about an admin surface is
+// that its GATE is on the wire, not that a function returns the right value
+// when called from inside the process.
+//
+// What each case proves:
+//
+// - `admin_denies_every_route_without_a_bearer_token`,
+//   `admin_denies_every_route_with_a_wrong_bearer_token`,
+//   `admin_denies_every_route_when_no_admin_token_is_configured`: the whole
+//   route table (`ADMIN_ROUTES` below, both the JSON API and the panel,
+//   including a path that does not exist) denies with 401. The third is the
+//   FAIL-CLOSED case and the most important test in this section: with
+//   `ADMIN_API_TOKEN` unset -- and separately, set to the empty string -- a
+//   caller presenting a token, no token, and an empty token are all denied.
+//   An admin surface that can mint authority must never be reachable by
+//   default.
+// - `admin_creates_and_reads_back_every_entity`: create-then-read round
+//   trips for principals, groups, group members, resources and grants, plus
+//   the read-only roles list.
+// - `a_grant_created_through_the_admin_api_is_honoured_by_check_user_
+//   permission`: THE proof that this surface writes the same rows the
+//   authorization path reads. Everything is provisioned over HTTP through
+//   the admin API, and the assertion is made through the real gRPC
+//   `CheckUserPermission` / `LookupUserPermissions` handlers. A parallel
+//   universe (a second table, a second connection, a stale cache) fails here
+//   and nowhere else.
+// - `a_wildcard_grant_created_through_the_admin_api_is_expanded_by_lookup_
+//   user_permissions`: the `urc-*` pattern, created through the admin API,
+//   is expanded to concrete resource ids by the policy engine.
+// - `revoking_a_grant_through_the_admin_api_denies_the_next_check`,
+//   `admin_group_membership_grants_and_revokes_inherited_access`,
+//   `admin_suspending_a_principal_denies_the_next_check`,
+//   `admin_deleting_a_resource_denies_the_next_check`: the four revocation
+//   levers this surface offers, each proven by an authorization call that
+//   DENIES afterwards -- not by a 204 from the API.
+// - `admin_refuses_a_grant_whose_principal_kind_disagrees_with_the_
+//   principal` and `admin_refuses_an_unsupported_resource_pattern_and_an_
+//   unknown_principal`: the two ways to create a grant that would look
+//   correct in a listing and match nothing forever. Both refused at the API.
+// - `admin_reports_duplicates_instead_of_silently_doing_nothing`: a create
+//   that did not create anything answers 409, so an operator is never told
+//   they provisioned something they did not.
+// - `the_admin_panel_renders_what_it_manages_and_escapes_operator_text`: the
+//   HTML panel lists real rows, and a display name containing a `<script>`
+//   tag comes back escaped -- the panel is opened by the one person holding
+//   the admin token, so script execution there is credential theft.
+// - `admin_forms_create_and_revoke_through_the_same_operations_as_the_api`:
+//   the panel's own form endpoints create and revoke for real, and the
+//   result is visible to the authorization path -- the two front ends are
+//   not allowed to diverge.
+
+/// The admin bearer these tests configure. A fixed, publicly-known throwaway
+/// value, like every other credential in this repository's test tree.
+const TEST_ADMIN_TOKEN: &str = "test-only-admin-token-do-not-use-in-prod";
+
+/// Every route the admin surface exposes, plus one that does not exist.
+///
+/// The unauthenticated/wrong-token/unconfigured tests iterate this list, so
+/// adding a route without adding it here is the one gap that would go
+/// unnoticed -- which is why the list includes the fallback (`/admin` and
+/// `/admin/v1/does-not-exist`): an unauthenticated caller must not be able to
+/// tell a route that exists from one that does not.
+const ADMIN_ROUTES: [(&str, &str); 28] = [
+    ("GET", "/admin"),
+    ("GET", "/admin/v1/does-not-exist"),
+    ("GET", "/admin/v1/principals"),
+    ("POST", "/admin/v1/principals"),
+    (
+        "GET",
+        "/admin/v1/principals/00000000-0000-0000-0000-000000000009",
+    ),
+    (
+        "POST",
+        "/admin/v1/principals/00000000-0000-0000-0000-000000000009/status",
+    ),
+    ("GET", "/admin/v1/groups"),
+    ("POST", "/admin/v1/groups"),
+    (
+        "GET",
+        "/admin/v1/groups/00000000-0000-0000-0000-000000000009/members",
+    ),
+    (
+        "POST",
+        "/admin/v1/groups/00000000-0000-0000-0000-000000000009/members",
+    ),
+    (
+        "DELETE",
+        "/admin/v1/groups/00000000-0000-0000-0000-000000000009/members/00000000-0000-0000-0000-000000000008",
+    ),
+    ("GET", "/admin/v1/resources"),
+    ("POST", "/admin/v1/resources"),
+    ("DELETE", "/admin/v1/resources/urc-anything"),
+    ("GET", "/admin/v1/roles"),
+    ("GET", "/admin/v1/grants"),
+    ("POST", "/admin/v1/grants"),
+    (
+        "DELETE",
+        "/admin/v1/grants/00000000-0000-0000-0000-000000000009",
+    ),
+    ("GET", "/admin/ui"),
+    ("POST", "/admin/ui/principals"),
+    ("POST", "/admin/ui/principals/status"),
+    ("POST", "/admin/ui/groups"),
+    ("POST", "/admin/ui/groups/members/add"),
+    ("POST", "/admin/ui/groups/members/remove"),
+    ("POST", "/admin/ui/resources"),
+    ("POST", "/admin/ui/resources/delete"),
+    ("POST", "/admin/ui/grants"),
+    ("POST", "/admin/ui/grants/delete"),
+];
+
+/// The gRPC/authorization harness plus this service's REAL HTTP router bound
+/// to a real ephemeral port, both over the SAME database -- which is what
+/// makes "provision over HTTP, assert over gRPC" a meaningful proof rather
+/// than two unrelated code paths agreeing by luck.
+struct AdminHarness {
+    inner: Harness,
+    base_url: String,
+    client: reqwest::Client,
+}
+
+impl AdminHarness {
+    async fn new(backend: Backend) -> Self {
+        Self::with_admin_token(backend, Some(TEST_ADMIN_TOKEN)).await
+    }
+
+    async fn with_admin_token(backend: Backend, admin_api_token: Option<&str>) -> Self {
+        let inner = Harness::new(backend).await;
+
+        let state = lore_authz_server::http::AppState {
+            signing_keys: inner.auth_service.signing_keys.clone(),
+            db: Some(inner.db.clone()),
+            // The admin surface has no dependency on an identity provider,
+            // and these cases deliberately configure none: nothing about
+            // provisioning may require a working IdP.
+            oidc: None,
+            oidc_login: lore_authz_server::oidc_login::OidcLoginSettings::default(),
+            admin_api_token: admin_api_token.map(|token| Arc::new(token.to_string())),
+        };
+
+        // Port 0 -> the OS picks a free port, so these run in parallel with
+        // each other and with every other test in this file.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind an ephemeral port for the admin HTTP surface");
+        let base_url = format!(
+            "http://{}",
+            listener.local_addr().expect("the bound address")
+        );
+        let router = lore_authz_server::http::router(state);
+        tokio::spawn(async move { axum::serve(listener, router).await });
+
+        Self {
+            inner,
+            base_url,
+            client: reqwest::Client::new(),
+        }
+    }
+
+    fn method(name: &str) -> reqwest::Method {
+        name.parse().expect("a valid HTTP method name")
+    }
+
+    /// One request, with full control over whether (and what) credential is
+    /// presented -- the deny cases need "no header at all" and "a header
+    /// with the wrong value" to be distinguishable in the TEST even though
+    /// they are indistinguishable in the RESPONSE.
+    async fn send(
+        &self,
+        method: &str,
+        path: &str,
+        token: Option<&str>,
+        json: Option<serde_json::Value>,
+    ) -> reqwest::Response {
+        let mut request = self
+            .client
+            .request(Self::method(method), format!("{}{path}", self.base_url));
+        if let Some(token) = token {
+            request = request.header("authorization", format!("Bearer {token}"));
+        }
+        if let Some(json) = json {
+            request = request.json(&json);
+        }
+        request.send().await.expect("the admin HTTP request")
+    }
+
+    async fn get(&self, path: &str) -> reqwest::Response {
+        self.send("GET", path, Some(TEST_ADMIN_TOKEN), None).await
+    }
+
+    async fn post(&self, path: &str, json: serde_json::Value) -> reqwest::Response {
+        self.send("POST", path, Some(TEST_ADMIN_TOKEN), Some(json))
+            .await
+    }
+
+    async fn delete(&self, path: &str) -> reqwest::Response {
+        self.send("DELETE", path, Some(TEST_ADMIN_TOKEN), None)
+            .await
+    }
+
+    /// A panel form submission: `application/x-www-form-urlencoded`, exactly
+    /// as a browser sends it.
+    async fn post_form(&self, path: &str, form: &[(&str, &str)]) -> reqwest::Response {
+        self.client
+            .post(format!("{}{path}", self.base_url))
+            .header("authorization", format!("Bearer {TEST_ADMIN_TOKEN}"))
+            .form(form)
+            .send()
+            .await
+            .expect("the admin form submission")
+    }
+
+    async fn json(&self, response: reqwest::Response) -> serde_json::Value {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        serde_json::from_str(&body)
+            .unwrap_or_else(|err| panic!("expected JSON (status {status}): {err}: {body}"))
+    }
+
+    /// Creates a principal through the ADMIN API (not `insert_principal`) and
+    /// returns its id. Every provisioning step in this section goes through
+    /// the surface under test.
+    async fn create_principal(&self, display_name: &str, is_service_account: bool) -> Uuid {
+        let response = self
+            .post(
+                "/admin/v1/principals",
+                serde_json::json!({
+                    "display_name": display_name,
+                    "is_service_account": is_service_account,
+                }),
+            )
+            .await;
+        assert_eq!(response.status(), 201, "create principal");
+        let body = self.json(response).await;
+        Uuid::parse_str(body["id"].as_str().expect("id in the response"))
+            .expect("a uuid in the response")
+    }
+
+    async fn create_group(&self, name: &str) -> Uuid {
+        let response = self
+            .post("/admin/v1/groups", serde_json::json!({ "name": name }))
+            .await;
+        assert_eq!(response.status(), 201, "create group");
+        let body = self.json(response).await;
+        Uuid::parse_str(body["id"].as_str().expect("id in the response"))
+            .expect("a uuid in the response")
+    }
+
+    async fn create_resource(&self, resource_id: &str) {
+        let response = self
+            .post(
+                "/admin/v1/resources",
+                serde_json::json!({ "resource_id": resource_id }),
+            )
+            .await;
+        assert_eq!(response.status(), 201, "create resource");
+    }
+
+    /// Creates a grant and returns its id.
+    async fn create_grant(
+        &self,
+        role: &str,
+        resource_pattern: &str,
+        principal_kind: &str,
+        principal_id: Uuid,
+    ) -> Uuid {
+        let response = self
+            .post(
+                "/admin/v1/grants",
+                serde_json::json!({
+                    "role": role,
+                    "resource_pattern": resource_pattern,
+                    "principal_kind": principal_kind,
+                    "principal_id": principal_id.to_string(),
+                }),
+            )
+            .await;
+        assert_eq!(response.status(), 201, "create grant");
+        let body = self.json(response).await;
+        Uuid::parse_str(body["id"].as_str().expect("id in the response"))
+            .expect("a uuid in the response")
+    }
+
+    /// Asks the REAL gRPC `CheckUserPermission` handler what this principal
+    /// can do -- the authorization path, not the admin surface.
+    async fn allowed_permissions(&self, user: Uuid, resource_id: &str) -> Vec<String> {
+        let response = self
+            .inner
+            .auth_service
+            .check_user_permission(self.inner.request_with_bearer(
+                epic_urc::CheckUserPermissionRequest {
+                    resource_id: vec![resource_id.to_string()],
+                    target_user: None,
+                },
+                user,
+            ))
+            .await
+            .expect("check_user_permission")
+            .into_inner();
+        response
+            .allowed_resource_permission
+            .into_iter()
+            .flat_map(|permission| permission.permission)
+            .collect()
+    }
+
+    async fn lookup_resource_ids(&self, user: Uuid) -> Vec<String> {
+        let response = self
+            .inner
+            .auth_service
+            .lookup_user_permissions(self.inner.request_with_bearer(
+                epic_urc::LookupUserPermissionsRequest {
+                    resource_filter: "urc".to_string(),
+                    ..Default::default()
+                },
+                user,
+            ))
+            .await
+            .expect("lookup_user_permissions")
+            .into_inner();
+        response
+            .resource_permission
+            .into_iter()
+            .map(|permission| permission.resource_id)
+            .collect()
+    }
+}
+
+/// No `authorization` header at all, on every route. Every one denies with
+/// 401, and none of them leaks the configured token.
+pub async fn admin_denies_every_route_without_a_bearer_token(backend: Backend) {
+    let h = AdminHarness::new(backend).await;
+
+    for (method, path) in ADMIN_ROUTES {
+        let response = h.send(method, path, None, None).await;
+        assert_eq!(
+            response.status(),
+            401,
+            "{method} {path} must deny an unauthenticated caller"
+        );
+        let body = response.text().await.unwrap_or_default();
+        assert!(
+            !body.contains(TEST_ADMIN_TOKEN),
+            "{method} {path} echoed the configured admin token into its response body"
+        );
+    }
+}
+
+/// A syntactically valid bearer token that is not the configured one.
+pub async fn admin_denies_every_route_with_a_wrong_bearer_token(backend: Backend) {
+    let h = AdminHarness::new(backend).await;
+
+    // Includes a strict PREFIX of the real token, which a naive
+    // `starts_with` comparison would accept.
+    let wrong_tokens = [
+        "not-the-admin-token",
+        &TEST_ADMIN_TOKEN[..TEST_ADMIN_TOKEN.len() - 1],
+        "",
+    ];
+
+    for (method, path) in ADMIN_ROUTES {
+        for wrong in wrong_tokens {
+            let response = h.send(method, path, Some(wrong), None).await;
+            assert_eq!(
+                response.status(),
+                401,
+                "{method} {path} must deny the wrong bearer token {wrong:?}"
+            );
+        }
+    }
+}
+
+/// THE fail-closed case. With `ADMIN_API_TOKEN` unset -- and, separately, set
+/// to the empty string -- every admin route denies every caller, including
+/// one presenting what would be the right token if one were configured, and
+/// including one presenting an empty token (which must not "match" an empty
+/// configured value).
+pub async fn admin_denies_every_route_when_no_admin_token_is_configured(backend: Backend) {
+    for configured in [None, Some("")] {
+        let h = AdminHarness::with_admin_token(backend, configured).await;
+
+        for (method, path) in ADMIN_ROUTES {
+            for presented in [None, Some(TEST_ADMIN_TOKEN), Some("")] {
+                let response = h.send(method, path, presented, None).await;
+                assert_eq!(
+                    response.status(),
+                    401,
+                    "with ADMIN_API_TOKEN {configured:?}, {method} {path} must deny a caller \
+                     presenting {presented:?} -- an unconfigured admin surface must never \
+                     default to open"
+                );
+            }
+        }
+    }
+}
+
+/// Create-then-read round trips for every entity this surface manages.
+pub async fn admin_creates_and_reads_back_every_entity(backend: Backend) {
+    let h = AdminHarness::new(backend).await;
+
+    // --- principals ------------------------------------------------------
+    let response = h
+        .post(
+            "/admin/v1/principals",
+            serde_json::json!({
+                "display_name": "Ada Lovelace",
+                "preferred_username": "ada",
+                "email": "ada@example.com",
+                "external_id": "scim-1234",
+                "source": "scim",
+                "subject": "idp-subject-1234",
+                "idp": "https://idp.example.com",
+            }),
+        )
+        .await;
+    assert_eq!(response.status(), 201);
+    let created = h.json(response).await;
+    let principal_id = created["id"].as_str().expect("id").to_string();
+    assert_eq!(created["display_name"], "Ada Lovelace");
+    assert_eq!(created["preferred_username"], "ada");
+    assert_eq!(created["email"], "ada@example.com");
+    // external_id/source/subject are the SCIM-facing fields; a create that
+    // dropped them would only be noticed by a Phase 3 SCIM sync creating
+    // duplicate identities.
+    assert_eq!(created["external_id"], "scim-1234");
+    assert_eq!(created["source"], "scim");
+    assert_eq!(created["subject"], "idp-subject-1234");
+    assert_eq!(created["idp"], "https://idp.example.com");
+    assert_eq!(created["status"], "active");
+    assert_eq!(created["is_service_account"], false);
+
+    let fetched = h
+        .json(h.get(&format!("/admin/v1/principals/{principal_id}")).await)
+        .await;
+    assert_eq!(
+        fetched, created,
+        "GET must return exactly what POST created"
+    );
+
+    let service_account = h.create_principal("Build Robot", true).await;
+    let listed = h.json(h.get("/admin/v1/principals").await).await;
+    assert_eq!(listed["truncated"], false);
+    let ids: Vec<String> = listed["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .map(|item| item["id"].as_str().expect("id").to_string())
+        .collect();
+    assert!(ids.contains(&principal_id));
+    assert!(ids.contains(&service_account.to_string()));
+
+    // --- status ----------------------------------------------------------
+    let suspended = h
+        .json(
+            h.post(
+                &format!("/admin/v1/principals/{principal_id}/status"),
+                serde_json::json!({ "status": "suspended" }),
+            )
+            .await,
+        )
+        .await;
+    assert_eq!(suspended["status"], "suspended");
+    // The lowercase status the API returns must be a value the API accepts
+    // back -- see `crate::admin::api`'s module doc comment.
+    let round_tripped = h
+        .json(
+            h.post(
+                &format!("/admin/v1/principals/{principal_id}/status"),
+                serde_json::json!({ "status": suspended["status"] }),
+            )
+            .await,
+        )
+        .await;
+    assert_eq!(round_tripped["status"], "suspended");
+
+    // --- groups and members ----------------------------------------------
+    let response = h
+        .post(
+            "/admin/v1/groups",
+            serde_json::json!({ "name": "platform", "description": "platform team" }),
+        )
+        .await;
+    assert_eq!(response.status(), 201);
+    let group = h.json(response).await;
+    let group_id = group["id"].as_str().expect("id").to_string();
+    assert_eq!(group["name"], "platform");
+    assert_eq!(group["description"], "platform team");
+
+    let listed = h.json(h.get("/admin/v1/groups").await).await;
+    assert_eq!(listed["items"][0]["name"], "platform");
+
+    let response = h
+        .post(
+            &format!("/admin/v1/groups/{group_id}/members"),
+            serde_json::json!({ "principal_id": principal_id }),
+        )
+        .await;
+    assert_eq!(response.status(), 204);
+    let members = h
+        .json(h.get(&format!("/admin/v1/groups/{group_id}/members")).await)
+        .await;
+    assert_eq!(members["items"][0]["principal_id"], principal_id.as_str());
+    assert_eq!(members["items"][0]["display_name"], "Ada Lovelace");
+
+    let response = h
+        .delete(&format!(
+            "/admin/v1/groups/{group_id}/members/{principal_id}"
+        ))
+        .await;
+    assert_eq!(response.status(), 204);
+    let members = h
+        .json(h.get(&format!("/admin/v1/groups/{group_id}/members")).await)
+        .await;
+    assert!(members["items"].as_array().expect("items").is_empty());
+
+    // --- resources -------------------------------------------------------
+    let response = h
+        .post(
+            "/admin/v1/resources",
+            serde_json::json!({ "resource_id": "urc-repo1", "resource_name": "repo one" }),
+        )
+        .await;
+    assert_eq!(response.status(), 201);
+    let listed = h.json(h.get("/admin/v1/resources").await).await;
+    assert_eq!(listed["items"][0]["resource_id"], "urc-repo1");
+    assert_eq!(listed["items"][0]["resource_name"], "repo one");
+    assert_eq!(listed["items"][0]["deleted"], false);
+
+    let response = h.delete("/admin/v1/resources/urc-repo1").await;
+    assert_eq!(response.status(), 204);
+    let listed = h.json(h.get("/admin/v1/resources").await).await;
+    // Soft-deleted, therefore still listed and flagged -- not hidden.
+    assert_eq!(listed["items"][0]["resource_id"], "urc-repo1");
+    assert_eq!(listed["items"][0]["deleted"], true);
+
+    // --- roles (read only) -----------------------------------------------
+    let roles = h.json(h.get("/admin/v1/roles").await).await;
+    let roles = roles.as_array().expect("a bare array of roles").clone();
+    let names: Vec<&str> = roles
+        .iter()
+        .map(|role| role["name"].as_str().expect("name"))
+        .collect();
+    assert_eq!(names, vec!["admin", "reader", "writer"]);
+    let admin_role = roles
+        .iter()
+        .find(|role| role["name"] == "admin")
+        .expect("the seeded admin role");
+    assert_eq!(
+        admin_role["permissions"]
+            .as_array()
+            .expect("permissions")
+            .iter()
+            .map(|permission| permission.as_str().expect("a permission string"))
+            .collect::<Vec<_>>(),
+        vec!["admin", "read", "write"],
+        "both backends must report the seeded permission set identically"
+    );
+
+    // --- grants ----------------------------------------------------------
+    let grantee = h.create_principal("Grace", false).await;
+    let grant_id = h.create_grant("reader", "urc-repo1", "user", grantee).await;
+    let listed = h.json(h.get("/admin/v1/grants").await).await;
+    assert_eq!(listed["items"][0]["id"], grant_id.to_string());
+    assert_eq!(listed["items"][0]["role_name"], "reader");
+    assert_eq!(listed["items"][0]["resource_pattern"], "urc-repo1");
+    assert_eq!(listed["items"][0]["principal_kind"], "user");
+    assert_eq!(listed["items"][0]["principal_id"], grantee.to_string());
+
+    let response = h.delete(&format!("/admin/v1/grants/{grant_id}")).await;
+    assert_eq!(response.status(), 204);
+    let listed = h.json(h.get("/admin/v1/grants").await).await;
+    assert!(listed["items"].as_array().expect("items").is_empty());
+}
+
+/// THE proof this surface is wired to the same data the authorization path
+/// reads: everything is provisioned over HTTP, and the assertion is made
+/// through the real gRPC handlers.
+pub async fn a_grant_created_through_the_admin_api_is_honoured_by_check_user_permission(
+    backend: Backend,
+) {
+    let h = AdminHarness::new(backend).await;
+
+    let user = h.create_principal("Provisioned User", false).await;
+    h.create_resource("urc-provisioned").await;
+
+    // Before the grant: the principal exists and the resource exists, and
+    // the answer is still no. Without this half, a check that always
+    // returned "allowed" would pass the second half.
+    assert!(
+        h.allowed_permissions(user, "urc-provisioned")
+            .await
+            .is_empty(),
+        "a principal with no grant must be denied even though both it and the resource exist"
+    );
+
+    h.create_grant("writer", "urc-provisioned", "user", user)
+        .await;
+
+    assert_eq!(
+        sorted(h.allowed_permissions(user, "urc-provisioned").await),
+        vec!["read".to_string(), "write".to_string()],
+        "a grant created through the admin API must be honoured by CheckUserPermission"
+    );
+    assert_eq!(
+        h.lookup_resource_ids(user).await,
+        vec!["urc-provisioned".to_string()],
+        "and by LookupUserPermissions, which is lore-server's only candidate list"
+    );
+}
+
+/// The wildcard pattern, created through the admin API, is expanded to
+/// concrete resource ids by the same policy engine -- never returned as the
+/// literal `urc-*`, which lore-server would silently drop.
+pub async fn a_wildcard_grant_created_through_the_admin_api_is_expanded_by_lookup_user_permissions(
+    backend: Backend,
+) {
+    let h = AdminHarness::new(backend).await;
+
+    let user = h.create_principal("Wildcard User", false).await;
+    h.create_resource("urc-alpha").await;
+    h.create_resource("urc-beta").await;
+    h.create_grant("admin", "urc-*", "user", user).await;
+
+    assert_eq!(
+        h.lookup_resource_ids(user).await,
+        vec!["urc-alpha".to_string(), "urc-beta".to_string()],
+        "a wildcard grant must expand to the concrete registered resources"
+    );
+    assert_eq!(
+        sorted(h.allowed_permissions(user, "urc-alpha").await),
+        vec!["admin".to_string(), "read".to_string(), "write".to_string()]
+    );
+    // A resource that was never registered is still denied, wildcard or not.
+    assert!(
+        h.allowed_permissions(user, "urc-never-created")
+            .await
+            .is_empty()
+    );
+}
+
+pub async fn revoking_a_grant_through_the_admin_api_denies_the_next_check(backend: Backend) {
+    let h = AdminHarness::new(backend).await;
+
+    let user = h.create_principal("Revoked User", false).await;
+    h.create_resource("urc-revoked").await;
+    let grant_id = h.create_grant("reader", "urc-revoked", "user", user).await;
+    assert_eq!(
+        h.allowed_permissions(user, "urc-revoked").await,
+        vec!["read".to_string()]
+    );
+
+    assert_eq!(
+        h.delete(&format!("/admin/v1/grants/{grant_id}"))
+            .await
+            .status(),
+        204
+    );
+    assert!(
+        h.allowed_permissions(user, "urc-revoked").await.is_empty(),
+        "revoking a grant must deny the NEXT authorization call, not merely return 204"
+    );
+
+    // Revoking it again is a 404, not a silent success: an operator must not
+    // be told "revoked" about a binding that was not there.
+    assert_eq!(
+        h.delete(&format!("/admin/v1/grants/{grant_id}"))
+            .await
+            .status(),
+        404
+    );
+}
+
+/// Group-inherited access, provisioned and revoked entirely through the admin
+/// API. The user never holds a direct binding at any point.
+pub async fn admin_group_membership_grants_and_revokes_inherited_access(backend: Backend) {
+    let h = AdminHarness::new(backend).await;
+
+    let user = h.create_principal("Group Member", false).await;
+    let group = h.create_group("engineering").await;
+    h.create_resource("urc-team-repo").await;
+    h.create_grant("writer", "urc-team-repo", "group", group)
+        .await;
+
+    // The grant exists on the GROUP, but the user is not a member yet.
+    assert!(
+        h.allowed_permissions(user, "urc-team-repo")
+            .await
+            .is_empty()
+    );
+
+    assert_eq!(
+        h.post(
+            &format!("/admin/v1/groups/{group}/members"),
+            serde_json::json!({ "principal_id": user.to_string() }),
+        )
+        .await
+        .status(),
+        204
+    );
+    assert_eq!(
+        sorted(h.allowed_permissions(user, "urc-team-repo").await),
+        vec!["read".to_string(), "write".to_string()],
+        "membership alone must convey the group's grant"
+    );
+
+    assert_eq!(
+        h.delete(&format!("/admin/v1/groups/{group}/members/{user}"))
+            .await
+            .status(),
+        204
+    );
+    assert!(
+        h.allowed_permissions(user, "urc-team-repo")
+            .await
+            .is_empty(),
+        "removing the membership must deny the next authorization call"
+    );
+}
+
+/// Suspension is the widest revocation lever this surface offers: it denies
+/// every resource at once, without touching a single grant.
+pub async fn admin_suspending_a_principal_denies_the_next_check(backend: Backend) {
+    let h = AdminHarness::new(backend).await;
+
+    let user = h.create_principal("Suspendable User", false).await;
+    h.create_resource("urc-suspend-me").await;
+    h.create_grant("reader", "urc-*", "user", user).await;
+    assert_eq!(
+        h.allowed_permissions(user, "urc-suspend-me").await,
+        vec!["read".to_string()]
+    );
+
+    assert_eq!(
+        h.post(
+            &format!("/admin/v1/principals/{user}/status"),
+            serde_json::json!({ "status": "suspended" }),
+        )
+        .await
+        .status(),
+        200
+    );
+
+    // A suspended principal does not resolve at all, so the authorization
+    // path denies before it looks at any grant -- an Unauthenticated status,
+    // not an empty allow list.
+    let err = h
+        .inner
+        .auth_service
+        .check_user_permission(h.inner.request_with_bearer(
+            epic_urc::CheckUserPermissionRequest {
+                resource_id: vec!["urc-suspend-me".to_string()],
+                target_user: None,
+            },
+            user,
+        ))
+        .await
+        .expect_err("a suspended principal must be denied");
+    assert_eq!(err.code(), Code::Unauthenticated);
+
+    // And reactivating restores it, so suspension is a reversible lever
+    // rather than a one-way door.
+    assert_eq!(
+        h.post(
+            &format!("/admin/v1/principals/{user}/status"),
+            serde_json::json!({ "status": "active" }),
+        )
+        .await
+        .status(),
+        200
+    );
+    assert_eq!(
+        h.allowed_permissions(user, "urc-suspend-me").await,
+        vec!["read".to_string()]
+    );
+}
+
+pub async fn admin_deleting_a_resource_denies_the_next_check(backend: Backend) {
+    let h = AdminHarness::new(backend).await;
+
+    let user = h.create_principal("Resource User", false).await;
+    h.create_resource("urc-deletable").await;
+    h.create_grant("admin", "urc-*", "user", user).await;
+    assert!(
+        !h.allowed_permissions(user, "urc-deletable")
+            .await
+            .is_empty()
+    );
+
+    assert_eq!(
+        h.delete("/admin/v1/resources/urc-deletable").await.status(),
+        204
+    );
+    assert!(
+        h.allowed_permissions(user, "urc-deletable")
+            .await
+            .is_empty(),
+        "a soft-deleted resource must not be authorized by a surviving wildcard grant"
+    );
+}
+
+/// The grant that would look right in a listing and match nothing forever:
+/// the policy engine derives `principal_kind` from the PRINCIPAL ROW, so a
+/// binding recorded with the other kind is inert. Refused at the API.
+pub async fn admin_refuses_a_grant_whose_principal_kind_disagrees_with_the_principal(
+    backend: Backend,
+) {
+    let h = AdminHarness::new(backend).await;
+
+    let user = h.create_principal("A Human", false).await;
+    let robot = h.create_principal("A Robot", true).await;
+    let group = h.create_group("some-group").await;
+    h.create_resource("urc-kinds").await;
+
+    for (kind, principal_id, why) in [
+        ("service_account", user, "a user bound as a service account"),
+        ("user", robot, "a service account bound as a user"),
+        ("group", user, "a principal bound as a group"),
+        ("user", group, "a group bound as a user"),
+    ] {
+        let response = h
+            .post(
+                "/admin/v1/grants",
+                serde_json::json!({
+                    "role": "reader",
+                    "resource_pattern": "urc-kinds",
+                    "principal_kind": kind,
+                    "principal_id": principal_id.to_string(),
+                }),
+            )
+            .await;
+        assert!(
+            response.status() == 400 || response.status() == 404,
+            "{why} must be refused (got {}), because the policy engine would never match it",
+            response.status()
+        );
+    }
+
+    // Nothing was created by any of those attempts.
+    let listed = h.json(h.get("/admin/v1/grants").await).await;
+    assert!(listed["items"].as_array().expect("items").is_empty());
+}
+
+pub async fn admin_refuses_an_unsupported_resource_pattern_and_an_unknown_principal(
+    backend: Backend,
+) {
+    let h = AdminHarness::new(backend).await;
+    let user = h.create_principal("Pattern User", false).await;
+
+    // `urc-abc*` is the dangerous one: it LOOKS like a prefix pattern, and
+    // the policy engine would store it as a literal resource id that can
+    // never match.
+    for pattern in ["urc-abc*", "*", "", "repo1", "urc-"] {
+        let response = h
+            .post(
+                "/admin/v1/grants",
+                serde_json::json!({
+                    "role": "reader",
+                    "resource_pattern": pattern,
+                    "principal_kind": "user",
+                    "principal_id": user.to_string(),
+                }),
+            )
+            .await;
+        assert_eq!(
+            response.status(),
+            400,
+            "resource_pattern {pattern:?} must be refused"
+        );
+    }
+
+    // An unknown principal, an unknown role, and a malformed uuid.
+    let unknown = Uuid::new_v4();
+    assert_eq!(
+        h.post(
+            "/admin/v1/grants",
+            serde_json::json!({
+                "role": "reader",
+                "resource_pattern": "urc-*",
+                "principal_kind": "user",
+                "principal_id": unknown.to_string(),
+            }),
+        )
+        .await
+        .status(),
+        404
+    );
+    assert_eq!(
+        h.post(
+            "/admin/v1/grants",
+            serde_json::json!({
+                "role": "superuser",
+                "resource_pattern": "urc-*",
+                "principal_kind": "user",
+                "principal_id": user.to_string(),
+            }),
+        )
+        .await
+        .status(),
+        404,
+        "there is no role CRUD, so an unknown role must be a 404, never an auto-created role"
+    );
+    assert_eq!(
+        h.post(
+            "/admin/v1/grants",
+            serde_json::json!({
+                "role": "reader",
+                "resource_pattern": "urc-*",
+                "principal_kind": "user",
+                "principal_id": "not-a-uuid",
+            }),
+        )
+        .await
+        .status(),
+        400
+    );
+
+    // A resource id that is not well formed is refused by the SAME rule
+    // RebacApi::CreateResource applies, including the wildcard sentinel.
+    for resource_id in ["urc-*", "repo1", "urc-", ""] {
+        assert_eq!(
+            h.post(
+                "/admin/v1/resources",
+                serde_json::json!({ "resource_id": resource_id }),
+            )
+            .await
+            .status(),
+            400,
+            "resource_id {resource_id:?} must be refused"
+        );
+    }
+
+    // And an unsettable status.
+    assert_eq!(
+        h.post(
+            &format!("/admin/v1/principals/{user}/status"),
+            serde_json::json!({ "status": "deprovisioned" }),
+        )
+        .await
+        .status(),
+        400,
+        "only the statuses this surface documents may be set"
+    );
+}
+
+pub async fn admin_reports_duplicates_instead_of_silently_doing_nothing(backend: Backend) {
+    let h = AdminHarness::new(backend).await;
+
+    h.create_group("dupes").await;
+    assert_eq!(
+        h.post("/admin/v1/groups", serde_json::json!({ "name": "dupes" }))
+            .await
+            .status(),
+        409,
+        "a duplicate group name must be reported, not silently ignored"
+    );
+
+    h.create_resource("urc-dupe").await;
+    assert_eq!(
+        h.post(
+            "/admin/v1/resources",
+            serde_json::json!({ "resource_id": "urc-dupe" }),
+        )
+        .await
+        .status(),
+        409
+    );
+
+    let payload = serde_json::json!({
+        "display_name": "Twin",
+        "source": "oidc",
+        "subject": "the-same-subject",
+    });
+    assert_eq!(
+        h.post("/admin/v1/principals", payload.clone())
+            .await
+            .status(),
+        201
+    );
+    assert_eq!(
+        h.post("/admin/v1/principals", payload).await.status(),
+        409,
+        "a second principal with the same (source, subject) must be refused, since that pair is \
+         the identity an IdP asserts"
+    );
+
+    // A re-grant is NOT an error -- it is idempotent -- but it answers 200
+    // rather than 201 so the operator can tell nothing new was created.
+    let user = h.create_principal("Re-granted", false).await;
+    h.create_resource("urc-regrant").await;
+    let first = h
+        .post(
+            "/admin/v1/grants",
+            serde_json::json!({
+                "role": "reader",
+                "resource_pattern": "urc-regrant",
+                "principal_kind": "user",
+                "principal_id": user.to_string(),
+            }),
+        )
+        .await;
+    assert_eq!(first.status(), 201);
+    let first = h.json(first).await;
+    let second = h
+        .post(
+            "/admin/v1/grants",
+            serde_json::json!({
+                "role": "reader",
+                "resource_pattern": "urc-regrant",
+                "principal_kind": "user",
+                "principal_id": user.to_string(),
+            }),
+        )
+        .await;
+    assert_eq!(second.status(), 200);
+    let second = h.json(second).await;
+    assert_eq!(
+        first["id"], second["id"],
+        "the same binding, not a second one"
+    );
+}
+
+/// The panel renders real rows, and an operator-controlled field containing
+/// markup comes back escaped.
+pub async fn the_admin_panel_renders_what_it_manages_and_escapes_operator_text(backend: Backend) {
+    let h = AdminHarness::new(backend).await;
+
+    let hostile_name = "<script>alert('admin token')</script>";
+    let response = h
+        .post(
+            "/admin/v1/principals",
+            serde_json::json!({ "display_name": hostile_name }),
+        )
+        .await;
+    assert_eq!(response.status(), 201);
+    let principal_id = h.json(response).await["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+
+    let group = h.create_group("panel-group").await;
+    h.create_resource("urc-panel").await;
+    let grant_id = h
+        .create_grant(
+            "admin",
+            "urc-*",
+            "user",
+            Uuid::parse_str(&principal_id).expect("uuid"),
+        )
+        .await;
+
+    let response = h.get("/admin/ui").await;
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.starts_with("text/html")),
+        Some(true)
+    );
+    let body = response.text().await.expect("the panel body");
+
+    // It lists what it manages.
+    for expected in [
+        principal_id.as_str(),
+        &group.to_string(),
+        "panel-group",
+        "urc-panel",
+        &grant_id.to_string(),
+        "urc-*",
+        "reader",
+        "writer",
+        "admin",
+    ] {
+        assert!(
+            body.contains(expected),
+            "the panel must list {expected:?}; it rendered: {body}"
+        );
+    }
+
+    // And it escapes. The raw tag must not appear anywhere in the document;
+    // the escaped form must.
+    assert!(
+        !body.contains("<script>"),
+        "the panel rendered an unescaped <script> tag from a provisioning field"
+    );
+    assert!(
+        body.contains("&lt;script&gt;alert(&#39;admin token&#39;)&lt;/script&gt;"),
+        "the hostile display name must appear, escaped: {body}"
+    );
+
+    // The panel must never render the admin token into the page it serves.
+    assert!(
+        !body.contains(TEST_ADMIN_TOKEN),
+        "the panel leaked the admin token into its own HTML"
+    );
+}
+
+/// The panel's form endpoints are not a second, weaker implementation: they
+/// create and revoke through the same operations, and the result is visible
+/// to the authorization path.
+pub async fn admin_forms_create_and_revoke_through_the_same_operations_as_the_api(
+    backend: Backend,
+) {
+    let h = AdminHarness::new(backend).await;
+
+    // Create a principal through the FORM endpoint. The client follows the
+    // 303 back to the panel, exactly as a browser would.
+    let response = h
+        .post_form("/admin/ui/principals", &[("display_name", "Form User")])
+        .await;
+    assert_eq!(
+        response.status(),
+        200,
+        "the form POST redirects to the panel"
+    );
+    let body = response.text().await.expect("the panel body");
+    assert!(
+        body.contains("Principal created."),
+        "the panel must confirm the create: {body}"
+    );
+
+    let listed = h.json(h.get("/admin/v1/principals").await).await;
+    let user = listed["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .find(|item| item["display_name"] == "Form User")
+        .map(|item| Uuid::parse_str(item["id"].as_str().expect("id")).expect("uuid"))
+        .expect("the principal the form created must be visible to the API");
+
+    // Register a resource and grant through the form endpoints too.
+    h.post_form("/admin/ui/resources", &[("resource_id", "urc-form")])
+        .await;
+    let response = h
+        .post_form(
+            "/admin/ui/grants",
+            &[
+                ("role", "reader"),
+                ("resource_pattern", "urc-form"),
+                ("principal_kind", "user"),
+                ("principal_id", &user.to_string()),
+            ],
+        )
+        .await;
+    assert!(
+        response
+            .text()
+            .await
+            .expect("the panel body")
+            .contains("Grant created.")
+    );
+
+    assert_eq!(
+        h.allowed_permissions(user, "urc-form").await,
+        vec!["read".to_string()],
+        "a grant created through the PANEL must be honoured by the authorization path"
+    );
+
+    // A form submission that fails re-renders the panel with the error and
+    // the error's own status, rather than redirecting to a success page.
+    let response = h
+        .post_form(
+            "/admin/ui/grants",
+            &[
+                ("role", "reader"),
+                ("resource_pattern", "urc-abc*"),
+                ("principal_kind", "user"),
+                ("principal_id", &user.to_string()),
+            ],
+        )
+        .await;
+    assert_eq!(response.status(), 400);
+    let body = response.text().await.expect("the panel body");
+    assert!(
+        body.contains("resource_pattern"),
+        "a failed form POST must explain itself: {body}"
+    );
+
+    // And revoke through the form endpoint.
+    let listed = h.json(h.get("/admin/v1/grants").await).await;
+    let grant_id = listed["items"][0]["id"].as_str().expect("id").to_string();
+    let response = h
+        .post_form("/admin/ui/grants/delete", &[("grant_id", &grant_id)])
+        .await;
+    assert!(
+        response
+            .text()
+            .await
+            .expect("the panel body")
+            .contains("Grant revoked.")
+    );
+    assert!(
+        h.allowed_permissions(user, "urc-form").await.is_empty(),
+        "a revoke through the PANEL must deny the next authorization call"
+    );
+}

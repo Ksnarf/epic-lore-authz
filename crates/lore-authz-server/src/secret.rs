@@ -1,12 +1,16 @@
-//! The three secret-handling primitives this crate needs in more than one
-//! place: generating a high-entropy token, hashing one for storage, and
-//! comparing one without a timing side channel.
+//! The secret-handling primitives this crate needs in more than one place:
+//! generating a high-entropy token, hashing one for storage, comparing one
+//! without a timing side channel, and reading one out of an `authorization`
+//! header value.
 //!
 //! These live in their own module rather than being duplicated per call site
-//! deliberately. `crate::service_auth` (the `RebacApi` shared-secret gate)
-//! and `crate::sessions` (login session codes) both need constant-time
+//! deliberately. `crate::service_auth` (the `RebacApi` shared-secret gate),
+//! `crate::admin::auth` (the admin-surface shared-secret gate) and
+//! `crate::sessions` (login session codes) all need constant-time
 //! comparison; a security primitive with two copies is a security primitive
-//! with two chances to be fixed only once.
+//! with two chances to be fixed only once. The same reasoning applies to
+//! `strip_bearer`, which had two byte-identical copies (`crate::caller` and
+//! `crate::service_auth`) before the admin surface needed a third.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -65,6 +69,30 @@ pub fn sha256_b64url(value: &str) -> String {
 /// using it would both fail `cargo clippy -D warnings` and rely on an API
 /// its own docs say not to depend on. A small hand-rolled XOR-accumulate
 /// comparison is the standard, dependency-free way to do this instead.
+/// Reads the credential out of a raw `authorization` header/metadata value:
+/// strips a leading `"Bearer "` prefix (matching the lore CLI's own
+/// `set_auth_header` convention), and treats an empty value as "no token
+/// present".
+///
+/// The empty-is-absent rule is not cosmetic. Per the pinned fork's
+/// `authnz/common.rs::can_create_request_without_authorization` test,
+/// lore-server's own `create_request_with_authorization` forwards a literal
+/// EMPTY string, not a missing header, when it has nothing to forward -- so
+/// an empty value must be treated as absent, never as a malformed token, and
+/// never (with an unset expected secret) as "empty matches empty".
+///
+/// Returns the value verbatim when there is no `"Bearer "` prefix, because
+/// both this crate's gates compare the whole remainder against a configured
+/// secret and a caller that sends a bare token should fail on the comparison,
+/// not on the framing.
+pub fn strip_bearer(raw: &str) -> Option<&str> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.strip_prefix("Bearer ").unwrap_or(trimmed))
+}
+
 pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -100,6 +128,23 @@ mod tests {
         assert_ne!(sha256_b64url(&token), token);
         assert_ne!(sha256_b64url("a"), sha256_b64url("b"));
         assert_eq!(sha256_b64url("").len(), 43);
+    }
+
+    /// The empty-value case is the load-bearing one: lore-server forwards a
+    /// literal empty `authorization` value rather than omitting the header,
+    /// and every gate in this crate must read that as "no credential
+    /// presented" -- see this function's doc comment.
+    #[test]
+    fn strip_bearer_reads_a_credential_and_treats_empty_as_absent() {
+        assert_eq!(strip_bearer("Bearer abc"), Some("abc"));
+        assert_eq!(strip_bearer("  Bearer abc  "), Some("abc"));
+        assert_eq!(strip_bearer("abc"), Some("abc"));
+        assert_eq!(strip_bearer(""), None);
+        assert_eq!(strip_bearer("   "), None);
+        // Case matters (RFC 6750 spells the scheme "Bearer"); a lowercase
+        // scheme is not silently accepted, it is simply compared verbatim
+        // and therefore fails the secret comparison.
+        assert_eq!(strip_bearer("bearer abc"), Some("bearer abc"));
     }
 
     #[test]

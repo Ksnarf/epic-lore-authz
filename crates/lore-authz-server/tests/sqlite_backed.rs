@@ -216,3 +216,96 @@ async fn exchange_denies_an_authz_shaped_token_presented_for_renewal() {
 async fn start_auth_session_without_a_provider_denies_against_real_db() {
     authz_suite::start_auth_session_without_a_provider_denies_against_real_db(Backend::Sqlite).await
 }
+
+// --- ADMIN SURFACE ------------------------------------------------------
+// Same one-line-wrapper rule as above: every body lives exactly once, in
+// `authz_suite`, and BOTH backends call all of them. See that module's
+// "ADMIN SURFACE" section for what each case proves.
+
+#[tokio::test]
+async fn admin_denies_every_route_without_a_bearer_token() {
+    authz_suite::admin_denies_every_route_without_a_bearer_token(Backend::Sqlite).await
+}
+
+#[tokio::test]
+async fn admin_denies_every_route_with_a_wrong_bearer_token() {
+    authz_suite::admin_denies_every_route_with_a_wrong_bearer_token(Backend::Sqlite).await
+}
+
+#[tokio::test]
+async fn admin_denies_every_route_when_no_admin_token_is_configured() {
+    authz_suite::admin_denies_every_route_when_no_admin_token_is_configured(Backend::Sqlite).await
+}
+
+#[tokio::test]
+async fn admin_creates_and_reads_back_every_entity() {
+    authz_suite::admin_creates_and_reads_back_every_entity(Backend::Sqlite).await
+}
+
+#[tokio::test]
+async fn a_grant_created_through_the_admin_api_is_honoured_by_check_user_permission() {
+    authz_suite::a_grant_created_through_the_admin_api_is_honoured_by_check_user_permission(
+        Backend::Sqlite,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn a_wildcard_grant_created_through_the_admin_api_is_expanded_by_lookup_user_permissions() {
+    authz_suite::a_wildcard_grant_created_through_the_admin_api_is_expanded_by_lookup_user_permissions(Backend::Sqlite).await
+}
+
+#[tokio::test]
+async fn revoking_a_grant_through_the_admin_api_denies_the_next_check() {
+    authz_suite::revoking_a_grant_through_the_admin_api_denies_the_next_check(Backend::Sqlite).await
+}
+
+#[tokio::test]
+async fn admin_group_membership_grants_and_revokes_inherited_access() {
+    authz_suite::admin_group_membership_grants_and_revokes_inherited_access(Backend::Sqlite).await
+}
+
+#[tokio::test]
+async fn admin_suspending_a_principal_denies_the_next_check() {
+    authz_suite::admin_suspending_a_principal_denies_the_next_check(Backend::Sqlite).await
+}
+
+#[tokio::test]
+async fn admin_deleting_a_resource_denies_the_next_check() {
+    authz_suite::admin_deleting_a_resource_denies_the_next_check(Backend::Sqlite).await
+}
+
+#[tokio::test]
+async fn admin_refuses_a_grant_whose_principal_kind_disagrees_with_the_principal() {
+    authz_suite::admin_refuses_a_grant_whose_principal_kind_disagrees_with_the_principal(
+        Backend::Sqlite,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn admin_refuses_an_unsupported_resource_pattern_and_an_unknown_principal() {
+    authz_suite::admin_refuses_an_unsupported_resource_pattern_and_an_unknown_principal(
+        Backend::Sqlite,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn admin_reports_duplicates_instead_of_silently_doing_nothing() {
+    authz_suite::admin_reports_duplicates_instead_of_silently_doing_nothing(Backend::Sqlite).await
+}
+
+#[tokio::test]
+async fn the_admin_panel_renders_what_it_manages_and_escapes_operator_text() {
+    authz_suite::the_admin_panel_renders_what_it_manages_and_escapes_operator_text(Backend::Sqlite)
+        .await
+}
+
+#[tokio::test]
+async fn admin_forms_create_and_revoke_through_the_same_operations_as_the_api() {
+    authz_suite::admin_forms_create_and_revoke_through_the_same_operations_as_the_api(
+        Backend::Sqlite,
+    )
+    .await
+}

@@ -78,19 +78,7 @@
 use tonic::Status;
 
 use crate::secret::constant_time_eq;
-
-/// Strips a leading `"Bearer "` prefix, matching `crate::caller::
-/// strip_bearer`'s convention, and treats an empty string as "no token
-/// present" for the same reason documented there (lore-server's own
-/// `create_request_with_authorization` forwards a literal empty string, not
-/// a missing header, when it has nothing to forward).
-fn strip_bearer(raw: &str) -> Option<&str> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    Some(trimmed.strip_prefix("Bearer ").unwrap_or(trimmed))
-}
+use crate::secret::strip_bearer;
 
 /// Verifies the caller of a `RebacApi` RPC. `configured_secret` is
 /// `AuthApiService`/`RebacApiService`'s own `REBAC_SERVICE_TOKEN` value

@@ -104,6 +104,59 @@ pub async fn delete_resource(db: &Db, resource_id: &str) -> Result<(), sqlx::Err
     Ok(())
 }
 
+/// A resource as the admin surface lists it. Includes soft-deleted rows,
+/// flagged -- an operator needs to see that a resource EXISTS BUT IS DELETED
+/// (which is why access to it is denied), and a list that silently hid them
+/// would make a deleted resource look like a missing one.
+#[derive(Debug, Clone)]
+pub struct ResourceSummary {
+    pub resource_id: String,
+    pub resource_name: String,
+    pub deleted: bool,
+}
+
+/// Every resource, deleted ones included and flagged, for the admin list
+/// view. Ordered by `resource_id` (the primary key, so the ordering is total)
+/// and bounded by `limit`.
+///
+/// Deliberately NOT reusing `list_resource_ids_with_prefix` below: that
+/// function is an AUTHORIZATION input (`LookupUserPermissions`' candidate
+/// set) and must keep excluding deleted rows. Giving it an
+/// "include deleted" flag would put a boolean between an authorization path
+/// and the rows it is allowed to consider, which is exactly the kind of
+/// parameter that gets passed wrong once.
+pub async fn list_resources(db: &Db, limit: i64) -> Result<Vec<ResourceSummary>, sqlx::Error> {
+    let rows: Vec<(String, String, bool)> = match db {
+        Db::Postgres(handle) => {
+            sqlx::query_as(
+                "SELECT resource_id, resource_name, (deleted_at IS NOT NULL) AS deleted \
+                 FROM resources ORDER BY resource_id LIMIT $1",
+            )
+            .bind(limit)
+            .fetch_all(&handle.pool)
+            .await?
+        }
+        Db::Sqlite(handle) => {
+            sqlx::query_as(
+                "SELECT resource_id, resource_name, (deleted_at IS NOT NULL) AS deleted \
+                 FROM resources ORDER BY resource_id LIMIT ?",
+            )
+            .bind(limit)
+            .fetch_all(&handle.pool)
+            .await?
+        }
+    };
+
+    Ok(rows
+        .into_iter()
+        .map(|(resource_id, resource_name, deleted)| ResourceSummary {
+            resource_id,
+            resource_name,
+            deleted,
+        })
+        .collect())
+}
+
 /// Candidate resource ids for `LookupUserPermissions`: every NOT-deleted
 /// resource whose id starts with `prefix` (lore-server's real call site
 /// sends the literal string `"urc"` -- see
