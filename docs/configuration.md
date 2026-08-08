@@ -20,11 +20,11 @@ Every value in `.env.example` is a placeholder. Never commit a real `.env`
 | `AUTHZ_TOKEN_TTL_SECS` | no | `3600` (1h) | AuthZ token lifetime. Keep short: see the stateless-revocation-window note in `docs/protocol-notes.md`. |
 | `TOKEN_IDP` | no | `local` | `idp` claim fallback for principals with no recorded identity provider (`Principal.idp` unset -- the manual/test provisioning path). **Must not be empty**, and the process refuses to start if it is: an AuthZ token with an empty or absent `idp` is ACCEPTED by lore-server and then silently stripped of its `resources` claim, surfacing as a permissions bug rather than a claims error. See `docs/protocol-notes.md` section 2 and `docs/open-questions.md` Q13. Principals provisioned through OIDC record their own `idp` and ignore this. |
 | `AUTH_SESSION_TTL_SECS` | no | `300` (5m) | How long a browser login session (`StartAuthSession` -> `GetAuthSession`) stays usable. Deliberately longer than the lore CLI's own hard 150-second polling budget -- see the "The 150-second client login deadline" section below. |
-| `PUBLIC_BASE_URL` | **yes for login** | (none) | Origin this service is reachable at IN A BROWSER (scheme + host + optional port, no path), e.g. `https://authz.example.com`. `StartAuthSession` builds the `login_url` it hands the CLI as `<PUBLIC_BASE_URL>/login/<login_code>`. **Unset means `StartAuthSession` denies with `Status::failed_precondition`** rather than issuing a login URL that goes nowhere; a warning is logged at startup. If unset, this falls back to the origin of `OIDC_REDIRECT_URL`, which is usually the same host. |
+| `PUBLIC_BASE_URL` | **yes for login, and for the admin panel** | (none) | Origin this service is reachable at IN A BROWSER (scheme + host + optional port, no path), e.g. `https://authz.example.com`. `StartAuthSession` builds the `login_url` it hands the CLI as `<PUBLIC_BASE_URL>/login/<login_code>`, and the admin surface's same-origin (CSRF) gate compares every state-changing request's `Origin`/`Referer` against it -- see "Same-origin enforcement" below. **Unset means `StartAuthSession` denies with `Status::failed_precondition`** rather than issuing a login URL that goes nowhere, **and every `/admin/ui` form POST is refused with `403`** because there is no origin to check it against; a warning naming both is logged at startup. Behind a reverse proxy this must be the origin the OPERATOR's browser sees (the proxy's), not this process's listen address. If unset, this falls back to the origin of `OIDC_REDIRECT_URL`, which is usually the same host. |
 | `SIGNING_KEY_SOURCE` | no | `file:///CHANGE_ME/signing-key.der` | Phase 0: a `file://` unencrypted PKCS#8 EC P-256 private key, PEM or raw DER (NOT a JWK -- see `crates/lore-authz-server/src/signing.rs`). If the file does not exist, an ephemeral dev key is generated in memory and a warning is logged. Phase 1+: real key management. |
 | `JWKS_PATH` | no | `/.well-known/jwks.json` | Path on the HTTP listener to serve this service's own JWKS on. |
 | `REBAC_SERVICE_TOKEN` | **yes, effectively** | (none) | Shared secret gating `RebacApi::CreateResource`/`DeleteResource` (security review remediation -- see `docs/open-questions.md` Q6). Present as `authorization: Bearer <value>` on those two RPCs only; unrelated to `JWT_ISSUER`/`JWT_AUDIENCE` and not a JWT. **Unset means both RPCs deny every caller** with `Status::unauthenticated` (`crates/lore-authz-server/src/service_auth.rs`) -- a deliberate fail-closed default, not a bug. See the dedicated section below for the honest gap this does and does not close. |
-| `ADMIN_API_TOKEN` | **yes to provision anything** | (none) | Shared secret gating the ENTIRE admin surface: the `/admin/v1` provisioning API and the `/admin/ui` panel, both on the HTTP listener. Present as `authorization: Bearer <value>`; a static secret, not a JWT. **Unset (or empty) means every `/admin` request is denied with 401**, including one presenting a token -- a deliberate fail-closed default with no bypass flag. See the dedicated section below: this setting can mint authority over every repository, so treat it as a root credential and restrict `/admin` at your reverse proxy too. |
+| `ADMIN_API_TOKEN` | **yes to provision anything** | (none) | Shared secret gating the ENTIRE admin surface: the `/admin/v1` provisioning API and the `/admin/ui` panel, both on the HTTP listener. Present as `authorization: Bearer <value>`; a static secret, not a JWT. **Unset (or empty) means every `/admin` request is denied with 401**, including one presenting a token -- a deliberate fail-closed default with no bypass flag. See the dedicated section below: this setting can mint authority over every repository, so treat it as a root credential and restrict `/admin` at your reverse proxy too. This token is NOT by itself CSRF protection when a proxy injects it for an IP range -- see "Same-origin enforcement" below. |
 | `GRPC_LISTEN_ADDR` | no | `0.0.0.0:8443` | `UrcAuthApi` + `RebacApi`. Must be reachable over TLS trusted by the lore CLI's native roots in any real deployment. |
 | `HTTP_LISTEN_ADDR` | no | `0.0.0.0:8080` | JWKS, login, OIDC/SAML callbacks, health, metrics. |
 | `OIDC_ISSUER_URL` / `OIDC_CLIENT_ID` / `OIDC_CLIENT_SECRET` / `OIDC_REDIRECT_URL` | **yes for login** | (none) | The identity provider browser login runs against. **All four are required together** -- a partially configured provider is treated as UNCONFIGURED and every login denies. See the dedicated section below. Multi-IdP deployments will configure `idp_connections` in the database instead (Phase 2+); these env vars are the single-tenant bring-up. |
@@ -220,6 +220,35 @@ response whatever the cause, so a probe cannot learn from the error whether
 a deployment has an admin token configured at all; the operator learns it
 from a warning in the startup log instead.
 
+### Same-origin enforcement (CSRF)
+
+**Every state-changing request under `/admin` -- `POST`, `DELETE`, and any
+method that is not `GET`/`HEAD` -- must come from this service's own origin,
+which is `PUBLIC_BASE_URL`.** The rule, applied in
+`crates/lore-authz-server/src/admin/origin.rs`:
+
+1. `Origin` present -> it must name `PUBLIC_BASE_URL`'s scheme + host + port,
+   or the request is refused with `403`.
+2. No `Origin` -> `Referer` is used the same way, on its scheme + host + port.
+3. Neither header -> the HTML form routes under `/admin/ui` are **refused**;
+   the rest of `/admin` (the JSON API) is allowed. A browser always sends
+   `Origin` on a cross-origin form POST, so a form submission carrying
+   neither header is not a browser; `curl` and every other non-browser client
+   send neither, and the JSON API is the interface they are meant to use.
+   Rules 1 and 2 still apply to `/admin/v1`, so a request that DOES declare
+   a foreign origin is refused there too.
+
+`GET`/`HEAD` are exempt: reading the panel changes nothing.
+
+**If `PUBLIC_BASE_URL` is unset there is nothing to compare against, so this
+gate refuses every state-changing request that declares an origin -- including
+one that would have matched -- and every `/admin/ui` form POST.** It never
+falls back to allowing. In practice: **the panel's forms do not work until
+`PUBLIC_BASE_URL` is set** (a startup warning says so), while header-less JSON
+automation is unaffected. This is the same value the browser login flow uses;
+there is deliberately no second setting for "our origin" that could disagree
+with it.
+
 ### Reaching the panel from a browser
 
 Every `/admin` route requires the `Authorization` header -- there is no
@@ -229,17 +258,41 @@ configuration. A browser cannot attach that header to an address-bar
 navigation on its own, so front the path with the same reverse proxy that
 should already be restricting it:
 
+> **WARNING -- an IP allowlist that injects the header is NOT a substitute for
+> per-request CSRF protection.** The moment a proxy adds the admin bearer to
+> every request from a trusted network, that credential stops being something
+> the caller must hold and becomes something the caller's NETWORK POSITION
+> earns. That is ambient authority, exactly like a cookie, and it is
+> CSRF-able in exactly the same way: an operator whose browser sits on the
+> allowlisted network, visiting any hostile page, is one auto-submitting
+> `<form>` away from that page creating an `admin` grant over `urc-*` in their
+> name -- no JavaScript, no CORS involvement, no preflight. **mTLS does not
+> fix this either**: a client certificate is also presented ambiently on a
+> cross-origin navigation. What closes it is the same-origin rule documented
+> in the section above, which this service now enforces on every
+> state-changing `/admin` request. Configure `PUBLIC_BASE_URL` to the origin
+> operators actually type into the address bar (the PROXY's origin, not
+> `127.0.0.1:8080`), or the panel's forms will be refused with `403`.
+
 ```nginx
 location /admin/ {
     allow 10.0.0.0/8;               # or mTLS, or a VPN-only listener
     deny  all;
     proxy_set_header Authorization "Bearer $ADMIN_TOKEN_FROM_YOUR_SECRETS";
+
+    # nginx forwards these unchanged by default; they are spelled out because
+    # they are exactly what the same-origin check reads, and a proxy that
+    # clears or rewrites them turns every panel form into a 403.
+    proxy_set_header Origin  $http_origin;
+    proxy_set_header Referer $http_referer;
+
     proxy_pass http://127.0.0.1:8080;
 }
 ```
 
 Any client that can set a header works without a proxy. The JSON API is the
-intended interface for automation:
+intended interface for automation, and it is unaffected by the same-origin
+rule as long as it declares no origin (which `curl` does not):
 
 ```sh
 curl -H "authorization: Bearer $ADMIN_API_TOKEN" \

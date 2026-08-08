@@ -313,3 +313,40 @@ async fn admin_forms_create_and_revoke_through_the_same_operations_as_the_api() 
     )
     .await
 }
+
+#[tokio::test]
+async fn admin_refuses_a_state_changing_request_from_a_foreign_origin() {
+    authz_suite::admin_refuses_a_state_changing_request_from_a_foreign_origin(Backend::Postgres)
+        .await
+}
+
+#[tokio::test]
+async fn admin_allows_a_state_changing_request_from_its_own_origin() {
+    authz_suite::admin_allows_a_state_changing_request_from_its_own_origin(Backend::Postgres).await
+}
+
+#[tokio::test]
+async fn admin_falls_back_to_the_referer_when_no_origin_is_present() {
+    authz_suite::admin_falls_back_to_the_referer_when_no_origin_is_present(Backend::Postgres).await
+}
+
+#[tokio::test]
+async fn admin_refuses_a_form_post_that_declares_no_origin_at_all() {
+    authz_suite::admin_refuses_a_form_post_that_declares_no_origin_at_all(Backend::Postgres).await
+}
+
+#[tokio::test]
+async fn admin_get_routes_are_unaffected_by_the_same_origin_check() {
+    authz_suite::admin_get_routes_are_unaffected_by_the_same_origin_check(Backend::Postgres).await
+}
+
+#[tokio::test]
+async fn admin_refuses_form_posts_when_no_public_base_url_is_configured() {
+    authz_suite::admin_refuses_form_posts_when_no_public_base_url_is_configured(Backend::Postgres)
+        .await
+}
+
+#[tokio::test]
+async fn a_cross_origin_form_post_cannot_create_an_admin_grant() {
+    authz_suite::a_cross_origin_form_post_cannot_create_an_admin_grant(Backend::Postgres).await
+}

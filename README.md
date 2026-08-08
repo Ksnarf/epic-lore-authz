@@ -110,6 +110,14 @@ token as a root credential -- this surface can bind a principal to `urc-*`
 with the `admin` role -- and restrict `/admin` at your reverse proxy as
 well; `docs/configuration.md` has a worked example.
 
+Every state-changing admin request is additionally required to be
+**same-origin** with `PUBLIC_BASE_URL`. That is not redundant with the token:
+the recommended proxy INJECTS the token for an allowlisted IP range, which
+makes it ambient authority and leaves the panel's HTML forms reachable by a
+cross-origin auto-submitting `<form>`. Set `PUBLIC_BASE_URL` to the origin
+operators actually browse to, or the panel's forms are refused with `403`.
+See "Same-origin enforcement" in `docs/configuration.md`.
+
 ## Prebuilt binaries
 
 Every tag matching `v*` builds both binaries below on native `ubuntu-24.04`

@@ -113,8 +113,9 @@ async fn main() -> anyhow::Result<()> {
     match admin_api_token {
         Some(_) => info!(
             "admin surface ENABLED at /admin/v1 (JSON API) and /admin/ui (panel) on the HTTP \
-             listener, gated on ADMIN_API_TOKEN -- restrict the /admin path at your reverse \
-             proxy as well, see docs/configuration.md"
+             listener, gated on ADMIN_API_TOKEN, with every state-changing request additionally \
+             required to be same-origin with PUBLIC_BASE_URL -- restrict the /admin path at your \
+             reverse proxy as well, see docs/configuration.md"
         ),
         None => warn!(
             "ADMIN_API_TOKEN is not set: every /admin request will be DENIED with 401 until it \
@@ -136,11 +137,18 @@ async fn main() -> anyhow::Result<()> {
         public_base_url: config.public_base_url.clone(),
         default_idp: config.token_idp.clone(),
     };
-    if login_settings.public_base_url.is_empty() {
+    // The SAME value is what the admin surface's same-origin gate compares an
+    // inbound `Origin`/`Referer` against (`crate::admin::origin`), so an unset
+    // PUBLIC_BASE_URL now costs two things, not one -- say both.
+    let public_base_url = Some(config.public_base_url.clone())
+        .filter(|value| !value.is_empty())
+        .map(Arc::new);
+    if public_base_url.is_none() {
         warn!(
             "PUBLIC_BASE_URL is not set (and no origin could be derived from OIDC_REDIRECT_URL): \
              StartAuthSession will deny with FailedPrecondition because it cannot build a browser \
-             login URL -- see docs/configuration.md"
+             login URL, AND the /admin/ui panel's forms will be denied with 403 because there is \
+             no origin to check them against -- see docs/configuration.md"
         );
     }
 
@@ -230,6 +238,7 @@ async fn main() -> anyhow::Result<()> {
         oidc,
         oidc_login: oidc_login_settings,
         admin_api_token,
+        public_base_url,
     };
     let http_server = async {
         let listener = tokio::net::TcpListener::bind(config.http_listen_addr).await?;

@@ -1707,6 +1707,39 @@ pub async fn migrations_are_idempotent(backend: Backend) {
 //   the panel's own form endpoints create and revoke for real, and the
 //   result is visible to the authorization path -- the two front ends are
 //   not allowed to diverge.
+//
+// ## Same-origin enforcement (CSRF)
+//
+// A review found the bearer gate above is NOT, by itself, CSRF protection
+// under the reverse proxy this project's own `docs/configuration.md`
+// recommends: that proxy INJECTS the admin bearer for an allowlisted IP
+// range, which makes the credential ambient, and every `/admin/ui` mutation
+// route takes an `axum::Form`, so a cross-origin auto-submitting HTML form
+// reaches it with no JavaScript and no preflight. See
+// `lore_authz_server::admin::origin`. These cases prove the fix on the wire,
+// on both backends:
+//
+// - `admin_refuses_a_state_changing_request_from_a_foreign_origin`: a
+//   mismatched `Origin` is refused on the form routes AND on the JSON API.
+// - `admin_allows_a_state_changing_request_from_its_own_origin`: the
+//   matching case still works, so the gate is not simply "deny everything".
+// - `admin_falls_back_to_the_referer_when_no_origin_is_present`: both
+//   directions of the fallback.
+// - `admin_refuses_a_form_post_that_declares_no_origin_at_all`: the
+//   fail-closed case for the form routes, and the deliberate exception that
+//   keeps header-less JSON automation (curl, scripts) working.
+// - `admin_get_routes_are_unaffected_by_the_same_origin_check`: reads are
+//   exempt, so a foreign `Origin` on a `GET` changes nothing.
+// - `admin_refuses_form_posts_when_no_public_base_url_is_configured`: with
+//   nothing to compare against, the gate denies rather than falling back to
+//   allowing.
+// - `a_cross_origin_form_post_cannot_create_an_admin_grant`: THE regression
+//   test for the finding. The exact attacker-shaped request -- a cross-origin
+//   form POST creating an `admin` grant over `urc-*` for the attacker's own
+//   principal -- is rejected, and the ABSENCE of the role binding is asserted
+//   through the real authorization read path, not merely inferred from the
+//   status code. A 403 with the row written anyway is the failure mode that
+//   matters, and only this assertion catches it.
 
 /// The admin bearer these tests configure. A fixed, publicly-known throwaway
 /// value, like every other credential in this repository's test tree.
@@ -1768,6 +1801,24 @@ const ADMIN_ROUTES: [(&str, &str); 28] = [
     ("POST", "/admin/ui/grants/delete"),
 ];
 
+/// What a harness configures as `PUBLIC_BASE_URL` -- the value the admin
+/// surface's same-origin gate compares an inbound `Origin`/`Referer` against
+/// (`lore_authz_server::admin::origin`).
+///
+/// `#[allow(dead_code)]` for the same per-binary reason `Backend` carries it:
+/// this module is compiled once per backend test binary and both variants are
+/// used in both, but a variant only reachable through one constructor can
+/// still read as unused to a per-binary analysis.
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+enum PublicOrigin {
+    /// The origin the test server is genuinely listening on -- a correctly
+    /// configured deployment.
+    Own,
+    /// `PUBLIC_BASE_URL` unset. There is then no origin to check against.
+    Unset,
+}
+
 /// The gRPC/authorization harness plus this service's REAL HTTP router bound
 /// to a real ephemeral port, both over the SAME database -- which is what
 /// makes "provision over HTTP, assert over gRPC" a meaningful proof rather
@@ -1784,7 +1835,34 @@ impl AdminHarness {
     }
 
     async fn with_admin_token(backend: Backend, admin_api_token: Option<&str>) -> Self {
+        Self::build(backend, admin_api_token, PublicOrigin::Own).await
+    }
+
+    async fn with_public_origin(backend: Backend, public_origin: PublicOrigin) -> Self {
+        Self::build(backend, Some(TEST_ADMIN_TOKEN), public_origin).await
+    }
+
+    async fn build(
+        backend: Backend,
+        admin_api_token: Option<&str>,
+        public_origin: PublicOrigin,
+    ) -> Self {
         let inner = Harness::new(backend).await;
+
+        // Port 0 -> the OS picks a free port, so these run in parallel with
+        // each other and with every other test in this file. Bound BEFORE the
+        // state is built, because `PublicOrigin::Own` means "the origin this
+        // listener actually answers on" and that is not known until now --
+        // which is also what makes the same-origin cases below real: the
+        // allowed origin is the server's true origin, not a constant both
+        // sides were handed.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind an ephemeral port for the admin HTTP surface");
+        let base_url = format!(
+            "http://{}",
+            listener.local_addr().expect("the bound address")
+        );
 
         let state = lore_authz_server::http::AppState {
             signing_keys: inner.auth_service.signing_keys.clone(),
@@ -1795,17 +1873,12 @@ impl AdminHarness {
             oidc: None,
             oidc_login: lore_authz_server::oidc_login::OidcLoginSettings::default(),
             admin_api_token: admin_api_token.map(|token| Arc::new(token.to_string())),
+            public_base_url: match public_origin {
+                PublicOrigin::Own => Some(Arc::new(base_url.clone())),
+                PublicOrigin::Unset => None,
+            },
         };
 
-        // Port 0 -> the OS picks a free port, so these run in parallel with
-        // each other and with every other test in this file.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind an ephemeral port for the admin HTTP surface");
-        let base_url = format!(
-            "http://{}",
-            listener.local_addr().expect("the bound address")
-        );
         let router = lore_authz_server::http::router(state);
         tokio::spawn(async move { axum::serve(listener, router).await });
 
@@ -1815,6 +1888,9 @@ impl AdminHarness {
             client: reqwest::Client::new(),
         }
     }
+
+    /// A foreign origin, for the CSRF cases. Never this server's own.
+    const HOSTILE_ORIGIN: &'static str = "https://hostile.example.com";
 
     fn method(name: &str) -> reqwest::Method {
         name.parse().expect("a valid HTTP method name")
@@ -1857,12 +1933,52 @@ impl AdminHarness {
             .await
     }
 
+    /// One request with arbitrary extra headers, for the same-origin cases:
+    /// `reqwest` never adds `Origin` or `Referer` of its own, so whatever is
+    /// passed here is exactly what the server sees.
+    async fn send_with_headers(
+        &self,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+    ) -> reqwest::Response {
+        let mut request = self
+            .client
+            .request(Self::method(method), format!("{}{path}", self.base_url))
+            .header("authorization", format!("Bearer {TEST_ADMIN_TOKEN}"));
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        request.send().await.expect("the admin HTTP request")
+    }
+
     /// A panel form submission: `application/x-www-form-urlencoded`, exactly
-    /// as a browser sends it.
+    /// as a browser sends it -- INCLUDING the `Origin` header a browser
+    /// always attaches to a cross-document form POST. Same-origin here,
+    /// because that is what the panel's own forms produce: they are served
+    /// from this origin.
     async fn post_form(&self, path: &str, form: &[(&str, &str)]) -> reqwest::Response {
-        self.client
+        self.post_form_declaring(path, form, &[("origin", self.base_url.as_str())])
+            .await
+    }
+
+    /// A form submission with EXPLICIT control over the origin-declaring
+    /// headers -- the CSRF cases need "a foreign `Origin`", "`Referer` only"
+    /// and "neither header at all" to be constructible.
+    async fn post_form_declaring(
+        &self,
+        path: &str,
+        form: &[(&str, &str)],
+        headers: &[(&str, &str)],
+    ) -> reqwest::Response {
+        let mut request = self
+            .client
             .post(format!("{}{path}", self.base_url))
-            .header("authorization", format!("Bearer {TEST_ADMIN_TOKEN}"))
+            .header("authorization", format!("Bearer {TEST_ADMIN_TOKEN}"));
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        request
             .form(form)
             .send()
             .await
@@ -2852,5 +2968,418 @@ pub async fn admin_forms_create_and_revoke_through_the_same_operations_as_the_ap
     assert!(
         h.allowed_permissions(user, "urc-form").await.is_empty(),
         "a revoke through the PANEL must deny the next authorization call"
+    );
+}
+
+// --- same-origin enforcement (CSRF) --------------------------------------
+
+/// The form fields of the attack in the finding: `admin` over EVERY
+/// repository, bound to a principal the attacker controls.
+fn admin_grant_over_everything(principal_id: &str) -> Vec<(&'static str, String)> {
+    vec![
+        ("role", "admin".to_string()),
+        ("resource_pattern", "urc-*".to_string()),
+        ("principal_kind", "user".to_string()),
+        ("principal_id", principal_id.to_string()),
+    ]
+}
+
+/// `post_form_declaring` takes `&[(&str, &str)]`; the helper above owns its
+/// strings, so this borrows them back into that shape.
+fn as_pairs<'a>(fields: &'a [(&'static str, String)]) -> Vec<(&'static str, &'a str)> {
+    fields
+        .iter()
+        .map(|(name, value)| (*name, value.as_str()))
+        .collect()
+}
+
+/// A state-changing request declaring an origin that is not this service's
+/// own is refused -- on the HTML form routes (where a browser can actually
+/// mount the attack) and on the JSON API (where it cannot today, but where
+/// the check costs nothing and holds the line if a route ever becomes
+/// form-reachable).
+pub async fn admin_refuses_a_state_changing_request_from_a_foreign_origin(backend: Backend) {
+    let h = AdminHarness::new(backend).await;
+    let user = h.create_principal("Origin Victim", false).await;
+
+    let response = h
+        .post_form_declaring(
+            "/admin/ui/principals",
+            &[("display_name", "Injected By A Foreign Page")],
+            &[("origin", AdminHarness::HOSTILE_ORIGIN)],
+        )
+        .await;
+    assert_eq!(
+        response.status(),
+        403,
+        "a form POST from a foreign origin must be refused"
+    );
+    let body = response.text().await.unwrap_or_default();
+    assert!(
+        !body.contains(TEST_ADMIN_TOKEN),
+        "the same-origin denial echoed the admin token into its body"
+    );
+
+    // Nothing was created.
+    let listed = h.json(h.get("/admin/v1/principals").await).await;
+    assert!(
+        listed["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .all(|item| item["display_name"] != "Injected By A Foreign Page"),
+        "a refused cross-origin form POST must not have created a principal"
+    );
+
+    // The JSON API is covered by the same rule when it DOES declare an
+    // origin. `send_with_headers` sends no body, so this asserts the request
+    // is stopped BEFORE the handler -- a 403 here rather than the 415 an
+    // absent JSON body would otherwise produce.
+    let delete_path = format!("/admin/v1/principals/{user}");
+    for (method, path) in [
+        ("POST", "/admin/v1/grants"),
+        ("POST", "/admin/v1/principals"),
+        ("DELETE", delete_path.as_str()),
+        // ...including paths that do not exist, so a cross-origin probe
+        // cannot map the surface by the difference between 403 and 404.
+        ("POST", "/admin/v1/does-not-exist"),
+        ("POST", "/admin/ui/does-not-exist"),
+    ] {
+        assert_eq!(
+            h.send_with_headers(method, path, &[("origin", AdminHarness::HOSTILE_ORIGIN)])
+                .await
+                .status(),
+            403,
+            "{method} {path} from a foreign origin must be refused"
+        );
+    }
+}
+
+/// The matching case: a form POST declaring THIS server's own origin goes
+/// through and does the work. Without this the gate could be "deny every
+/// state-changing request" and every deny case above would still pass.
+pub async fn admin_allows_a_state_changing_request_from_its_own_origin(backend: Backend) {
+    let h = AdminHarness::new(backend).await;
+
+    let response = h
+        .post_form_declaring(
+            "/admin/ui/principals",
+            &[("display_name", "Same Origin User")],
+            &[("origin", h.base_url.as_str())],
+        )
+        .await;
+    assert_eq!(
+        response.status(),
+        200,
+        "a same-origin form POST must succeed (303 to the panel, which the client follows)"
+    );
+    assert!(
+        response
+            .text()
+            .await
+            .expect("the panel body")
+            .contains("Principal created.")
+    );
+
+    let listed = h.json(h.get("/admin/v1/principals").await).await;
+    assert!(
+        listed["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .any(|item| item["display_name"] == "Same Origin User"),
+        "a same-origin form POST must actually create the principal"
+    );
+}
+
+/// `Referer` is the fallback when no `Origin` is present, and it is checked
+/// on its scheme+host+port exactly like `Origin` is.
+pub async fn admin_falls_back_to_the_referer_when_no_origin_is_present(backend: Backend) {
+    let h = AdminHarness::new(backend).await;
+
+    // Cross-origin Referer, no Origin -> denied.
+    let hostile_referer = format!("{}/some/page", AdminHarness::HOSTILE_ORIGIN);
+    assert_eq!(
+        h.post_form_declaring(
+            "/admin/ui/principals",
+            &[("display_name", "Referred By A Foreign Page")],
+            &[("referer", hostile_referer.as_str())],
+        )
+        .await
+        .status(),
+        403,
+        "a form POST whose only origin evidence is a foreign Referer must be refused"
+    );
+
+    // Matching Referer (a PATH on our origin, which is what a browser
+    // actually sends), no Origin -> allowed.
+    let own_referer = format!("{}/admin/ui", h.base_url);
+    let response = h
+        .post_form_declaring(
+            "/admin/ui/principals",
+            &[("display_name", "Referred By The Panel")],
+            &[("referer", own_referer.as_str())],
+        )
+        .await;
+    assert_eq!(
+        response.status(),
+        200,
+        "a Referer naming this service's own origin must be accepted"
+    );
+
+    let listed = h.json(h.get("/admin/v1/principals").await).await;
+    let names: Vec<String> = listed["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .map(|item| {
+            item["display_name"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect();
+    assert!(names.contains(&"Referred By The Panel".to_string()));
+    assert!(
+        !names.contains(&"Referred By A Foreign Page".to_string()),
+        "the refused request must not have created anything"
+    );
+}
+
+/// The fail-closed case for the form routes, and the one deliberate
+/// exception: header-less automation against the JSON API still works, which
+/// is what `curl` and every deployment script this product documents look
+/// like.
+pub async fn admin_refuses_a_form_post_that_declares_no_origin_at_all(backend: Backend) {
+    let h = AdminHarness::new(backend).await;
+
+    assert_eq!(
+        h.post_form_declaring(
+            "/admin/ui/principals",
+            &[("display_name", "No Origin At All")],
+            &[],
+        )
+        .await
+        .status(),
+        403,
+        "a form POST declaring no origin at all must be refused -- a browser always sends Origin \
+         on a cross-origin form POST, so this is not a browser doing what browsers do"
+    );
+
+    // ...and the JSON API, with the identical absence of headers, is
+    // unaffected: `create_principal` / `create_grant` / `delete` all go
+    // through `send`, which attaches neither Origin nor Referer.
+    let user = h.create_principal("Automation User", false).await;
+    h.create_resource("urc-automation").await;
+    h.create_grant("reader", "urc-automation", "user", user)
+        .await;
+    assert_eq!(
+        h.allowed_permissions(user, "urc-automation").await,
+        vec!["read".to_string()],
+        "header-less automation against the JSON API must keep working"
+    );
+    assert_eq!(
+        h.delete("/admin/v1/resources/urc-automation")
+            .await
+            .status(),
+        204,
+        "a header-less DELETE against the JSON API must keep working"
+    );
+
+    let listed = h.json(h.get("/admin/v1/principals").await).await;
+    assert!(
+        listed["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .all(|item| item["display_name"] != "No Origin At All"),
+        "the refused form POST must not have created anything"
+    );
+}
+
+/// Reads are exempt: the panel must still render for an operator, and a
+/// foreign `Origin` on a `GET` changes nothing, because there is nothing to
+/// change.
+pub async fn admin_get_routes_are_unaffected_by_the_same_origin_check(backend: Backend) {
+    let h = AdminHarness::new(backend).await;
+    h.create_principal("Readable User", false).await;
+
+    for path in ["/admin/ui", "/admin/v1/principals", "/admin/v1/roles"] {
+        for headers in [
+            &[("origin", AdminHarness::HOSTILE_ORIGIN)][..],
+            &[("referer", "https://hostile.example.com/page")][..],
+            &[][..],
+        ] {
+            let response = h.send_with_headers("GET", path, headers).await;
+            assert_eq!(
+                response.status(),
+                200,
+                "GET {path} reads state and must not be refused by the same-origin check \
+                 (headers: {headers:?})"
+            );
+        }
+    }
+
+    // The 404 fallback is reached by a GET too, and must still be a 404
+    // rather than becoming a 403 for an authenticated caller.
+    assert_eq!(
+        h.send_with_headers(
+            "GET",
+            "/admin/v1/does-not-exist",
+            &[("origin", AdminHarness::HOSTILE_ORIGIN)],
+        )
+        .await
+        .status(),
+        404
+    );
+}
+
+/// With `PUBLIC_BASE_URL` unset there is no origin to compare against, so the
+/// gate denies rather than falling back to allowing -- including a request
+/// that declares the origin the server is genuinely listening on, because
+/// this deployment has no way to know that is what it is.
+pub async fn admin_refuses_form_posts_when_no_public_base_url_is_configured(backend: Backend) {
+    let h = AdminHarness::with_public_origin(backend, PublicOrigin::Unset).await;
+
+    for headers in [&[("origin", AdminHarness::HOSTILE_ORIGIN)][..], &[][..]] {
+        assert_eq!(
+            h.post_form_declaring(
+                "/admin/ui/principals",
+                &[("display_name", "Unconfigured Origin")],
+                headers,
+            )
+            .await
+            .status(),
+            403,
+            "with no PUBLIC_BASE_URL, a form POST must be refused (headers: {headers:?})"
+        );
+    }
+    assert_eq!(
+        h.post_form_declaring(
+            "/admin/ui/principals",
+            &[("display_name", "Unconfigured Origin")],
+            &[("origin", h.base_url.as_str())],
+        )
+        .await
+        .status(),
+        403,
+        "with no PUBLIC_BASE_URL there is nothing to compare against, so even a request from the \
+         server's own true origin must be refused rather than allowed on a guess"
+    );
+
+    let listed = h.json(h.get("/admin/v1/principals").await).await;
+    assert!(
+        listed["items"].as_array().expect("items").is_empty(),
+        "none of the refused form POSTs may have created a principal"
+    );
+
+    // Header-less JSON automation is unaffected: an unset PUBLIC_BASE_URL
+    // costs the panel, not the API.
+    h.create_principal("Automation Still Works", false).await;
+}
+
+/// THE regression test for the finding.
+///
+/// The exact attacker-shaped request: an operator's browser sits behind the
+/// header-injecting reverse proxy from `docs/configuration.md`, loads a
+/// hostile page, and that page auto-submits a form to `/admin/ui/grants`
+/// asking for the `admin` role over `urc-*` for the attacker's own principal.
+/// The proxy authenticates it by source IP and injects the real token, so the
+/// bearer gate passes -- which is exactly why the bearer gate alone was never
+/// enough.
+///
+/// The assertion that matters is not the status code. It is that NO role
+/// binding exists afterwards, checked through the real authorization read
+/// path (`CheckUserPermission` and `LookupUserPermissions`, the same handlers
+/// lore-server calls), because "403 returned, row written anyway" is the
+/// failure mode a status-code assertion cannot see.
+pub async fn a_cross_origin_form_post_cannot_create_an_admin_grant(backend: Backend) {
+    let h = AdminHarness::new(backend).await;
+
+    let attacker = h.create_principal("Attacker Principal", false).await;
+    h.create_resource("urc-victim-one").await;
+    h.create_resource("urc-victim-two").await;
+
+    // Before: the attacker's principal exists, the repositories exist, and
+    // the answer is already no. Without this half, a check that always
+    // returned "denied" would pass the half that matters.
+    assert!(
+        h.allowed_permissions(attacker, "urc-victim-one")
+            .await
+            .is_empty()
+    );
+
+    let fields = admin_grant_over_everything(&attacker.to_string());
+    let response = h
+        .post_form_declaring(
+            "/admin/ui/grants",
+            &as_pairs(&fields),
+            // A browser attaches this automatically and cannot be talked out
+            // of it. It is the whole signal the fix rests on.
+            &[("origin", AdminHarness::HOSTILE_ORIGIN)],
+        )
+        .await;
+    // The status is captured but asserted LAST, deliberately. The failure
+    // this test exists to catch is "refused on the wire, row written anyway",
+    // so the EFFECT assertions below must be the ones that fire first -- a
+    // status assertion in front of them would panic and hide whether the
+    // grant was actually created.
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+
+    // ---- the assertions that actually prove it ---------------------------
+    // 1. The authorization path still denies, on every registered resource.
+    for resource in ["urc-victim-one", "urc-victim-two"] {
+        assert!(
+            h.allowed_permissions(attacker, resource).await.is_empty(),
+            "a refused cross-origin POST must leave NO permission on {resource} -- a 403 with the \
+             role binding written anyway is the failure this test exists to catch"
+        );
+    }
+    // 2. lore-server's only candidate list is still empty for this principal.
+    assert!(
+        h.lookup_resource_ids(attacker).await.is_empty(),
+        "LookupUserPermissions must return nothing for a principal whose grant was refused"
+    );
+    // 3. And the binding is not merely inert -- it does not exist at all.
+    let listed = h.json(h.get("/admin/v1/grants").await).await;
+    assert!(
+        listed["items"].as_array().expect("items").is_empty(),
+        "no role binding may have been written: {listed}"
+    );
+    // 4. ...and only now, the wire response itself.
+    assert_eq!(
+        status, 403,
+        "the cross-origin grant-creation POST must be refused"
+    );
+    assert!(
+        !body.contains(TEST_ADMIN_TOKEN),
+        "the denial echoed the admin token into its body"
+    );
+    assert!(
+        !body.contains("Grant created."),
+        "the denial rendered the panel's success banner: {body}"
+    );
+
+    // The same request from the panel's own origin DOES work -- so what was
+    // rejected above was the origin, not the request.
+    let response = h
+        .post_form_declaring(
+            "/admin/ui/grants",
+            &as_pairs(&fields),
+            &[("origin", h.base_url.as_str())],
+        )
+        .await;
+    assert!(
+        response
+            .text()
+            .await
+            .expect("the panel body")
+            .contains("Grant created."),
+        "the identical form, same-origin, must still be a working operator action"
+    );
+    assert_eq!(
+        sorted(h.allowed_permissions(attacker, "urc-victim-one").await),
+        vec!["admin".to_string(), "read".to_string(), "write".to_string()]
     );
 }

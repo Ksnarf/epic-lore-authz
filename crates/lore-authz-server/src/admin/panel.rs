@@ -21,6 +21,31 @@
 //! hidden field -- would add a second credential path into a surface that can
 //! mint authority, to save an operator one line of proxy configuration.
 //!
+//! ## CORRECTION: header-only auth is NOT, on its own, CSRF protection
+//!
+//! This module's doc comment used to reason from the paragraph above that
+//! CSRF does not apply here, because a browser cannot attach an
+//! `Authorization` header to a cross-origin navigation. That reasoning was
+//! wrong as written, and the mistake was reasoning about the header in
+//! isolation instead of about the deployment two paragraphs up.
+//!
+//! The recommended reverse proxy INJECTS the admin bearer for every request
+//! from an allowlisted IP range. That makes the credential ambient -- earned
+//! by network position, exactly like a cookie is earned by being the browser
+//! that holds it -- and every mutation route below takes an `axum::Form`, so
+//! it accepts `application/x-www-form-urlencoded`, which is one of the three
+//! enctypes a cross-origin `<form>` can submit with no preflight and no
+//! JavaScript. An operator whose browser sits on the allowlisted network,
+//! visiting any hostile page, was one auto-submitting form away from handing
+//! that page an `admin` grant over `urc-*`. mTLS in place of the IP allowlist
+//! changes nothing: a client certificate is presented ambiently too.
+//!
+//! What actually closes it is same-origin enforcement, which is now applied
+//! to every state-changing admin request in `crate::admin::origin` -- read
+//! that module for the rule, its scope, and why the JSON API is not in the
+//! same position. The bearer gate is unchanged and still required; it is just
+//! no longer claimed to be sufficient by itself.
+//!
 //! ## POST-then-redirect on success, re-render on failure
 //!
 //! A successful form POST answers `303 See Other` back to `/admin/ui?msg=...`

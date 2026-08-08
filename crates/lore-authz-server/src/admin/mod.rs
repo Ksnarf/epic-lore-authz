@@ -34,6 +34,18 @@
 //! when the setting is unset or empty, which denies EVERYTHING rather than
 //! defaulting to open.
 //!
+//! ## ...and every STATE-CHANGING route is same-origin checked too
+//!
+//! See `origin`. The bearer gate alone is not CSRF protection under the
+//! reverse proxy this project's own documentation recommends: a proxy that
+//! injects the admin bearer for an allowlisted IP range turns the credential
+//! into ambient authority, and a cross-origin auto-submitting HTML form then
+//! reaches every `axum::Form` route under `/admin/ui`. `origin` closes that
+//! by requiring a state-changing request's `Origin` (or, absent that,
+//! `Referer`) to name this service's own origin -- `PUBLIC_BASE_URL`, the
+//! same value the login flow uses. It is layered INSIDE the bearer gate, so
+//! an unauthenticated caller still sees only the `401`.
+//!
 //! ## Why the whole surface lives under one path prefix
 //!
 //! `/admin/**` and nothing else, kept clearly apart from the public
@@ -72,6 +84,7 @@ use crate::http::AppState;
 pub mod api;
 pub mod auth;
 pub mod ops;
+pub mod origin;
 pub mod panel;
 
 /// Hard cap on every admin list response.
@@ -163,11 +176,25 @@ impl IntoResponse for AdminError {
 
 /// The admin router, mounted by `crate::http::router` at `/admin`.
 ///
-/// `state` is passed in so the gate can be applied with
+/// `state` is passed in so both gates can be applied with
 /// `axum::middleware::from_fn_with_state`; `Router::layer` (rather than
 /// `route_layer`) is used deliberately, so the middleware also covers the
 /// fallback below and an unauthenticated caller sees the same 401 for a path
 /// that does not exist as for one that does.
+///
+/// ## Gate ORDER is load-bearing
+///
+/// `.layer()` applies outward, so the LAST call is the OUTERMOST middleware:
+/// `auth::require_admin` runs first and `origin::require_same_origin` runs
+/// inside it. That order is deliberate in both directions:
+///
+/// - Bearer first means a caller without a valid token gets the existing,
+///   uniform `401` no matter what origin it declares. The same-origin gate is
+///   invisible to anyone who has not already authenticated, so it adds no new
+///   oracle to an unauthenticated probe.
+/// - Same-origin second means it still fires for the case it exists to stop,
+///   which is precisely a request that DID authenticate -- because a reverse
+///   proxy injected the token on the browser's behalf.
 pub fn router(state: AppState) -> Router<AppState> {
     Router::new()
         // --- JSON provisioning API (scripting/automation) ----------------
@@ -215,6 +242,10 @@ pub fn router(state: AppState) -> Router<AppState> {
         .route("/ui/grants", post(panel::create_grant))
         .route("/ui/grants/delete", post(panel::delete_grant))
         .fallback(not_found)
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            origin::require_same_origin,
+        ))
         .layer(axum::middleware::from_fn_with_state(
             state,
             auth::require_admin,

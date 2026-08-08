@@ -67,6 +67,17 @@ pub struct AppState {
     /// `crate::admin::auth`. `Arc` so cloning this state per request does not
     /// copy the secret.
     pub admin_api_token: Option<Arc<String>>,
+    /// `PUBLIC_BASE_URL`: this service's own browser-facing origin, the SAME
+    /// value the OIDC login flow builds its `login_url` from (see
+    /// `crate::config::Config::from_env`, which falls back to the origin of
+    /// `OIDC_REDIRECT_URL`). `crate::admin::origin` compares the `Origin` /
+    /// `Referer` of every state-changing admin request against it.
+    ///
+    /// `None` (unset or empty) means there is nothing to compare against, and
+    /// that gate then denies every admin request that declares an origin plus
+    /// every `/admin/ui` form POST -- it never falls back to allowing. See
+    /// `crate::admin::origin`'s module doc comment.
+    pub public_base_url: Option<Arc<String>>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -304,6 +315,7 @@ mod tests {
             oidc: None,
             oidc_login: OidcLoginSettings::default(),
             admin_api_token: None,
+            public_base_url: None,
         }
     }
 
@@ -397,6 +409,7 @@ mod tests {
             oidc: Some(Arc::new(provider)),
             oidc_login: OidcLoginSettings::default(),
             admin_api_token: None,
+            public_base_url: None,
         };
 
         let response = login_page(State(state), Path(login_code)).await;
@@ -446,6 +459,7 @@ mod tests {
             oidc: Some(Arc::new(provider)),
             oidc_login: OidcLoginSettings::default(),
             admin_api_token: None,
+            public_base_url: None,
         };
 
         let response = oidc_callback(

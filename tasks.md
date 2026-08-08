@@ -1609,3 +1609,205 @@ the FULL `cargo test --workspace`):**
   - `tests/postgres_backed.rs`: **50** (was 35), real Postgres 16.
   - `tests/sqlite_backed.rs`: **50** (was 35) -- the EXACT SAME 50 names,
     same shared bodies, `Backend::Sqlite`.
+
+## SECURITY: CSRF on the admin panel, closed by same-origin enforcement (2026-08-08)
+
+**The finding.** `crates/lore-authz-server/src/admin/panel.rs`'s module doc
+argued that CSRF does not apply to this surface, because a browser cannot
+attach an `Authorization` header to an address-bar navigation. That is true of
+the header in isolation and FALSE of the deployment this project's own
+`docs/configuration.md` recommends two paragraphs later: an nginx example that
+injects the admin bearer into every request from an allowlisted IP range. A
+proxy that does that turns the credential into AMBIENT AUTHORITY -- earned by
+network position rather than possessed by the caller -- which is precisely the
+property that makes cookie-authenticated sites CSRF-able. mTLS is not a fix
+either: a client certificate is presented ambiently on a cross-origin
+navigation too.
+
+Every `/admin/ui/*` mutation route takes an `axum::Form`, so it accepts
+`application/x-www-form-urlencoded` -- one of the three enctypes a `<form>` can
+submit, none of which trigger a CORS preflight. **Exploit, plain HTML, no
+JavaScript**: an operator whose browser sits on the allowlisted network loads
+any hostile page; the page auto-submits a form to `/admin/ui/grants` with
+`role=admin&resource_pattern=urc-*&principal_kind=user&principal_id=<the
+attacker's own principal>`; the proxy authenticates by source IP and injects
+the real token; the attacker now holds `admin` over every repository.
+
+**This was not theoretical, and it was measured rather than argued.** With the
+fix's middleware temporarily deleted from the router and nothing else changed,
+`a_cross_origin_form_post_cannot_create_an_admin_grant` fails on its FIRST
+effect assertion -- `CheckUserPermission` reports a non-empty permission set
+for the attacker's principal on `urc-victim-one`. The cross-origin form POST
+really does mint the grant, and the authorization path really does honour it.
+Raw output in this session's PROOF block below. With the fix the same request
+is `403` and no binding exists.
+
+- [x] Same-origin gate on every state-changing admin request. [verified-e2e]
+      New `crates/lore-authz-server/src/admin/origin.rs`. On any method that is
+      not `GET`/`HEAD`, anywhere under `/admin`:
+      1. `Origin` present -> must equal this service's own origin, or DENY.
+      2. No `Origin`, `Referer` present -> its scheme+host+port must equal this
+         service's own origin, or DENY.
+      3. NEITHER header -> DENY under `/admin/ui` (the HTML form routes);
+         ALLOW under the rest of `/admin` (the JSON API). See the scoping
+         decision below -- this is the one deliberate asymmetry.
+      `GET`/`HEAD` are exempt: reading the panel changes nothing.
+      Both sides of every comparison go through the SAME normalizer
+      (`config::origin_of`, made `pub(crate)`, body unchanged), so
+      `https://x.example.com:443`, `https://x.example.com/` and
+      `https://X.EXAMPLE.COM` all compare equal to `https://x.example.com`,
+      while `https://x.example.com:8443`, `http://x.example.com` and
+      `https://x.example.com.hostile.example.com` do not. `Origin: null`
+      (sandboxed iframe, some redirect chains) is not a parseable URL and is
+      therefore REFUSED, not treated as "no origin declared".
+- [x] Scoping decision: strict rule 3 on `/admin/ui` only. [verified-e2e]
+      Verified from the code before scoping it, not assumed: every mutating
+      `/admin/v1` route takes `axum::Json` (POST) or carries no body on a
+      `DELETE` (`admin/api.rs`). A `<form>` cannot send
+      `content-type: application/json` and cannot issue a `DELETE`, so neither
+      shape is reachable from a cross-origin form. A cross-origin `fetch`
+      could set either, but only after a CORS preflight -- and a repo-wide
+      grep confirms this workspace mounts NO CORS layer anywhere (no
+      `CorsLayer`, no `tower-http` `cors` feature, no `OPTIONS` handler, no
+      `access-control-allow-origin` on any response), so the browser refuses
+      the real request. Applying rule 3 to `/admin/v1` would therefore have
+      cost every documented `curl` recipe and every deployment script (none of
+      which send `Origin` or `Referer`) in exchange for closing an attack a
+      browser cannot mount. Rules 1 and 2 DO still apply to `/admin/v1`: that
+      costs automation nothing, since it declares no origin, and keeps the
+      defence in place if a route there ever becomes form-reachable.
+- [x] `PUBLIC_BASE_URL` reused, not duplicated. [code-says]
+      `crate::http::AppState` gained `public_base_url: Option<Arc<String>>`,
+      fed in `main.rs` from the SAME `config.public_base_url` the OIDC login
+      flow already uses (which itself falls back to the origin of
+      `OIDC_REDIRECT_URL` -- see `Config::from_env`). No second setting, and
+      no second derivation, so the two notions of "our origin" cannot drift
+      apart.
+      **Unset (or empty) -> DENY, never allow**: with nothing to compare
+      against, the gate refuses every state-changing request that declares an
+      origin (INCLUDING one that would have matched -- unverifiable is not
+      verified) and every `/admin/ui` form POST. Header-less JSON automation
+      is unaffected, so an unset value costs the panel, not the API. The
+      startup warning in `main.rs` now names BOTH consequences (login URL and
+      admin panel) instead of only the first.
+- [x] Gate ORDER is deliberate and documented. [verified-e2e]
+      `.layer()` applies outward, so the LAST call is outermost:
+      `auth::require_admin` runs FIRST and `origin::require_same_origin` runs
+      inside it. Bearer-first means an unauthenticated caller still sees only
+      the existing uniform `401` whatever origin it declares, so this check
+      adds no new oracle to an unauthenticated probe -- proven by the
+      unchanged `admin_denies_every_route_*` cases, which still expect `401`
+      on all 28 routes. Same-origin-second means it still fires for the case
+      it exists to stop: a request that DID authenticate, because a proxy
+      injected the token for it.
+- [x] Denials leak nothing. [verified-e2e] One `403`, one fixed body, for all
+      four causes (foreign origin, unparseable origin, no origin declared,
+      no `PUBLIC_BASE_URL`). Applied with `Router::layer` like the bearer
+      gate, so it covers the admin router's 404 fallback too: a cross-origin
+      POST to `/admin/v1/does-not-exist` is refused identically to one aimed
+      at `/admin/v1/grants`, and cannot be used to map the surface. Only the
+      NORMALIZED origin is logged, never the raw header, so attacker-supplied
+      text cannot carry a newline or control character into a log line. The
+      admin token is asserted absent from every denial body.
+- [x] 7 new shared test bodies x BOTH backends (14 executions) + 12 new unit
+      tests. [verified-e2e] Added to the SHARED
+      `tests/authz_suite/mod.rs` with one-line wrappers in
+      `tests/postgres_backed.rs` and `tests/sqlite_backed.rs`, so the two
+      backends cannot drift. They drive the REAL axum router on a REAL
+      ephemeral socket with a REAL HTTP client against a REAL database.
+      `admin_refuses_a_state_changing_request_from_a_foreign_origin`,
+      `admin_allows_a_state_changing_request_from_its_own_origin`,
+      `admin_falls_back_to_the_referer_when_no_origin_is_present` (both
+      directions),
+      `admin_refuses_a_form_post_that_declares_no_origin_at_all` (which also
+      proves header-less JSON automation still works),
+      `admin_get_routes_are_unaffected_by_the_same_origin_check`,
+      `admin_refuses_form_posts_when_no_public_base_url_is_configured`,
+      `a_cross_origin_form_post_cannot_create_an_admin_grant`.
+      Plus 12 unit tests in `admin::origin`.
+      **The one that matters most**:
+      `a_cross_origin_form_post_cannot_create_an_admin_grant` reproduces the
+      exact attacker-shaped request and then asserts the ABSENCE of the role
+      binding through the REAL authorization read path -- `CheckUserPermission`
+      on each registered resource AND `LookupUserPermissions` (lore-server's
+      only candidate list) AND the admin grants listing -- not merely from the
+      status code. "403 returned, row written anyway" is the failure mode a
+      status assertion cannot see, and only that assertion catches it. It then
+      replays the IDENTICAL form same-origin and asserts it DOES create the
+      grant, so what was rejected was the origin and not the request.
+      The `AdminHarness` now binds its listener BEFORE building `AppState`, so
+      the configured `PUBLIC_BASE_URL` is the origin the test server genuinely
+      answers on rather than a constant handed to both sides.
+- [x] Documentation corrected where it was wrong, not just extended.
+      [code-says]
+      `admin/panel.rs`: the module doc's CSRF reasoning is now marked as a
+      CORRECTION and states plainly that header-only auth does NOT prevent
+      CSRF under a header-injecting proxy, and that same-origin enforcement is
+      what closes it. `admin/mod.rs`: a second gate section, plus the layer-
+      ordering rationale on `router`. `docs/configuration.md`: a new
+      "Same-origin enforcement (CSRF)" section, a prominent WARNING block on
+      the nginx example stating that an IP allowlist injecting the header is
+      NOT a substitute for per-request CSRF protection (and that mTLS is not
+      either), `proxy_set_header Origin/Referer/Host` lines in that example
+      with a note that stripping them turns every panel form into a 403, and
+      updated `PUBLIC_BASE_URL` / `ADMIN_API_TOKEN` table rows.
+      `README.md`: the provisioning section now says the token alone is not
+      CSRF protection.
+
+**Additive only.** The bearer gate, `verify_admin_caller`, `strip_bearer`,
+`constant_time_eq`, every `ops`/`db` function, every gRPC handler, the OIDC
+login flow and the JWKS/claims behaviour are untouched. The only changes to
+existing behaviour are (a) state-changing `/admin` requests are now
+origin-checked, and (b) `AppState` carries one more field.
+
+**Behaviour change existing operators must know about**: a `/admin/ui` form
+POST that carries neither `Origin` nor `Referer` now gets `403` where it
+previously succeeded. A browser always sends one, so this only affects a
+script that was POSTing to the HTML form routes by hand -- which should be
+using `/admin/v1` (unchanged). The existing test helper `post_form` was
+updated to attach the same-origin `Origin` header a browser attaches, which is
+why the pre-existing panel-form tests still pass.
+
+**Not done, deliberately**: no CORS layer was added (adding a permissive one
+to `/admin` would re-open exactly this hole); no `SameSite` cookie work,
+because there is still no cookie; no CSRF token, because that would make the
+panel stateful and the origin check is sufficient without it;
+`.env.example` still lacks `PUBLIC_BASE_URL` and `ADMIN_API_TOKEN` (the same
+`.env*` write block earlier passes hit -- nothing was worked around).
+
+**PROOF (all four checks run for real in the pinned build image
+`docker/Dockerfile.build`; the Postgres- and IdP-backed tests via `docker
+compose -f docker-compose.test.yml run --rm --build tests`, which brings up a
+real `postgres:16-alpine` AND a real `ghcr.io/dexidp/dex:v2.44.0` and runs the
+FULL `cargo test --workspace`):**
+
+- `cargo build --workspace`: clean, `Finished dev profile`, exit 0.
+- `cargo fmt --all -- --check`: clean, exit 0.
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean, exit 0.
+- `cargo test --workspace`: **223 passed, 0 failed** (was 197), compose exit 0:
+  - `lore-authz-core` / `lore-authz-proto`: 0 tests (unchanged).
+  - `lore-authz-server` unit tests: **89** (was 77) -- the 12 new
+    `admin::origin` cases.
+  - `tests/lore_compat.rs`: **4**, unchanged.
+  - `tests/oidc_flow.rs`: **16**, unchanged, against a REAL OIDC provider.
+  - `tests/postgres_backed.rs`: **57** (was 50), real Postgres 16.
+  - `tests/sqlite_backed.rs`: **57** (was 50) -- the EXACT SAME 57 names.
+- **Negative control** (the proof the tests are load-bearing, and the proof
+  the vulnerability was real): with the `origin::require_same_origin` layer
+  temporarily deleted from `admin::router` and nothing else changed,
+  `cargo test --test sqlite_backed` reports
+  `a_cross_origin_form_post_cannot_create_an_admin_grant ... FAILED`,
+  panicking on `a refused cross-origin POST must leave NO permission on
+  urc-victim-one -- a 403 with the role binding written anyway is the failure
+  this test exists to catch`. That assertion reads `CheckUserPermission`, so
+  the failure is direct evidence that the cross-origin form POST minted the
+  `admin` grant and the authorization path honoured it -- not an inference
+  from a status code. An earlier run of the same control (with the status
+  assertion still first) also failed
+  `admin_falls_back_to_the_referer_when_no_origin_is_present` and
+  `admin_refuses_a_form_post_that_declares_no_origin_at_all` with
+  `left: 200, right: 403`. The layer was restored and the full suite re-run
+  green afterwards.
+  This is also why the headline test asserts the ABSENCE of the binding
+  BEFORE it asserts the status: a status assertion in front would panic first
+  and hide whether the row was written, which is the failure that matters.

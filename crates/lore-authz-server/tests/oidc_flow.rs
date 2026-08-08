@@ -185,6 +185,12 @@ impl Harness {
                 // binds denies -- the fail-closed default, asserted directly
                 // in `tests/authz_suite/mod.rs`.
                 admin_api_token: None,
+                // The same origin the login settings above use. Only the
+                // admin surface's same-origin gate reads this field (see
+                // `admin::origin`), and this suite touches no admin route --
+                // it is set to the real value rather than `None` so this
+                // harness stays a faithful copy of a configured deployment.
+                public_base_url: Some(Arc::new(public_base_url())),
             },
             db,
             provider,

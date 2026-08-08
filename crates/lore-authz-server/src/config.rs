@@ -219,7 +219,15 @@ fn parse_bool_env(key: &str, default: bool) -> Result<bool, anyhow::Error> {
 /// Scheme + host + optional port of a URL, with no trailing slash -- e.g.
 /// `https://authz.example.com:8443/oidc/callback` -> `https://authz.example.com:8443`.
 /// Returns `None` for anything that is not a parseable absolute URL.
-fn origin_of(url: &str) -> Option<String> {
+///
+/// `pub(crate)` because `crate::admin::origin` compares an inbound `Origin` /
+/// `Referer` header against `PUBLIC_BASE_URL` and MUST normalize both sides
+/// the same way (a default port written out, a trailing slash, or a
+/// mixed-case host must not read as a different origin). Deriving this
+/// service's own origin twice, in two functions that could drift, is exactly
+/// the bug that would turn a same-origin gate into a same-origin-if-you-spell-
+/// it-our-way gate.
+pub(crate) fn origin_of(url: &str) -> Option<String> {
     let parsed = reqwest::Url::parse(url).ok()?;
     let host = parsed.host_str()?;
     Some(match parsed.port() {
