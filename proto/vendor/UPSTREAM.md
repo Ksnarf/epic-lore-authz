@@ -15,8 +15,8 @@ from these copies. See docs/protocol-notes.md and docs/architecture.md for why.
 
 | Vendored file        | Upstream path                              | SHA256 (this copy)                                              |
 |-----------------------|---------------------------------------------|------------------------------------------------------------------|
-| `auth_api.proto`      | `lore-proto/proto/auth_api.proto`           | `a1174b624f62007e3b414cb51c28ee2c074e293aabeda83534eaac9e967c3568` |
-| `rebac_api.proto`     | `lore-proto/proto/rebac_api.proto`          | `afb64b2a832c576dda4e59297a21cdf082a6c40aa8eed64f50ed6fc2fb9c5d6c` |
+| `auth_api.proto`      | `lore-proto/proto/auth_api.proto`           | `9c155eef922998aa75a402cd0353f9d0704561eba772fe8297c67083d33d02aa` |
+| `rebac_api.proto`     | `lore-proto/proto/rebac_api.proto`          | `d848bd840a052e0e311941ecf7ca5de54d403ace5f9b571f82b6b68972a93793` |
 
 Hashes are recorded in `SHA256SUMS` in this directory and are recomputed and
 checked by `.github/workflows/proto-drift.yml` on a schedule and can be
