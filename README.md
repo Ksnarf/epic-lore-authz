@@ -73,9 +73,33 @@ gRPC server code from the vendored protos -- see
 ```sh
 git clone https://github.com/Ksnarf/epic-lore-authz.git
 cd epic-lore-authz
-cp .env.example .env   # then fill in real values -- see docs/configuration.md
+cp env.example .env    # then fill in real values -- see docs/configuration.md
 cargo build --workspace
 ```
+
+### Configuration
+
+Every setting this service reads is listed in `env.example` at the repo
+root, with a placeholder value and a comment. Copy it to `.env` for local
+development, or set the same keys as environment variables / injected
+secrets in a real deployment. `.env` is gitignored; `env.example` must
+never contain a real value.
+
+Four of those settings are SECRETS and have no default:
+`ADMIN_API_TOKEN`, `REBAC_SERVICE_TOKEN`, `OIDC_CLIENT_SECRET`, and the
+credentials inside `DATABASE_URL`. Leaving each unset is a deliberate
+fail-closed default rather than an error: the admin surface denies every
+request, `RebacApi` denies every caller, OIDC login is disabled, and the
+database-backed RPCs refuse. Nothing silently becomes permissive.
+
+`ADMIN_API_TOKEN` in particular is a ROOT-EQUIVALENT credential: it can
+bind a principal to `urc-*` with the `admin` role, which is authority over
+every repository lore-server knows about. Generate it with something like
+`openssl rand -base64 32` and store it wherever your other deployment
+secrets live.
+
+`docs/configuration.md` documents each setting in full, including its
+default and its fail-closed behaviour.
 
 Running the binary (once Phase 0 lands -- see `tasks.md`):
 
