@@ -187,12 +187,16 @@ services:
   # Epic's lore-server (a patched build, published by this repo's release
   # workflow), configured to trust the sidecar.
   loreserver:
-    build:
-      context: .
-      dockerfile: Dockerfile.runtime
-      args:
-        RELEASE_TAG: ${LORE_AUTHZ_RELEASE:-v0.2.0}
+    # Deliberately NO build section: this is the same image the `authz`
+    # service builds, and giving two services one build block makes them race
+    # to name the same image ("already exists") on `up --build`. `up` builds
+    # every service that has a build section before it creates any container,
+    # so the image is here by the time this service starts. `pull_policy` is
+    # never rather than the default, so if that ever stops being true this
+    # fails with "image not found locally" instead of a confusing attempt to
+    # pull a name that was never published to a registry.
     image: lore-authz-demo/runtime:${LORE_AUTHZ_RELEASE:-v0.2.0}
+    pull_policy: never
     platform: linux/amd64
     depends_on:
       authz:
