@@ -1,0 +1,49 @@
+# WHY THIS PROXY EXISTS
+#
+# Every /admin route on the sidecar is gated on
+# `authorization: Bearer <ADMIN_API_TOKEN>`, and a browser cannot be told to
+# send that header by typing a URL into the address bar. There is no cookie
+# and no login form on the admin surface on purpose (see
+# docs/configuration.md, "Reaching the panel from a browser"), so the
+# documented deployment model is a reverse proxy that INJECTS the token for a
+# restricted network. This file is that proxy, locally, which is the only
+# reason http://localhost:PORT/admin/ui opens in a browser at all.
+#
+# AND WHY THE SAME-ORIGIN RULE EXISTS
+#
+# Injecting the token turns it into AMBIENT authority: it is no longer
+# something the caller holds, it is something the caller's network position
+# earns -- CSRF-able exactly like a cookie. That is why every state-changing
+# /admin request must additionally be same-origin with PUBLIC_BASE_URL. The
+# browser's own Origin and Referer headers are what that rule reads, and
+# nginx forwards them unchanged; they are spelled out below because a proxy
+# that clears or rewrites them turns every panel form into a 403.
+#
+# ${ADMIN_API_TOKEN} and ${PANEL_PORT} are substituted by the nginx image's
+# own envsubst step at container start. nginx's own runtime variables ($host,
+# $proxy_add_x_forwarded_for) are NOT substituted, because that step only
+# replaces names that exist in the environment.
+server {
+    listen ${PANEL_PORT};
+    server_name _;
+
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto http;
+
+    location /admin {
+        # In a real deployment this location is ALSO restricted (allow/deny,
+        # mTLS, or a VPN-only listener) -- see docs/configuration.md. This is
+        # a demo on a throwaway network, so it is not restricted here, and the
+        # token it injects is a published non-secret.
+        proxy_set_header Authorization "Bearer ${ADMIN_API_TOKEN}";
+        proxy_set_header Origin $http_origin;
+        proxy_set_header Referer $http_referer;
+        proxy_pass http://authz:8080;
+    }
+
+    location / {
+        proxy_pass http://authz:8080;
+    }
+}

@@ -1,0 +1,41 @@
+# Mock identity provider for the demo. Every value here is a throwaway local
+# dev value and none of it is a secret.
+#
+# `__DEX_ISSUER__` and `__PANEL_ORIGIN__` are substituted by the `dex` service
+# in docker-compose.yml before dex starts, because dex does not expand
+# environment variables in its own config file and both values depend on which
+# host ports the demo was started with.
+#
+# The issuer uses host.docker.internal so ONE hostname works from BOTH sides:
+#   - the containers (compose maps host.docker.internal to the host gateway)
+#   - the operator's browser on the host
+# See demo/README.md, "Linux note", for the one case where that needs help.
+issuer: __DEX_ISSUER__
+
+storage:
+  type: memory
+
+web:
+  http: 0.0.0.0:5556
+
+oauth2:
+  skipApprovalScreen: true
+
+staticClients:
+  - id: epic-lore-authz-demo
+    name: epic-lore-authz demo client
+    # Demo-only value, matching OIDC_CLIENT_SECRET in docker-compose.yml.
+    secret: demo-oidc-client-secret-not-a-real-secret
+    redirectURIs:
+      # The sidecar's OIDC callback, as the browser reaches it: through the
+      # panel proxy, which is the origin PUBLIC_BASE_URL names.
+      - '__PANEL_ORIGIN__/oidc/callback'
+
+connectors:
+  # Dex's built-in mock connector: one fixed test identity, no password, no
+  # real account anywhere. This is the "mock IdP user" the demo logs in as.
+  - type: mockCallback
+    id: mock
+    name: Mock
+
+enablePasswordDB: false

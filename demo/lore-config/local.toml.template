@@ -1,0 +1,35 @@
+# lore-server config for the demo. Rendered at container start by the
+# `loreserver` service in docker-compose.yml, which substitutes the three
+# `__PLACEHOLDER__` values from its environment so the issuer, the audience
+# and the service token are defined in exactly ONE place.
+#
+# Nothing here is a secret: __REBAC_SERVICE_TOKEN__ is replaced with the same
+# published demo value the sidecar is started with.
+
+[immutable_store.local]
+path = "/data"
+
+[mutable_store.local]
+path = "/data"
+
+[server.auth]
+# Must match the sidecar's JWT_ISSUER / JWT_AUDIENCE exactly, or lore-server
+# rejects every token this service mints.
+jwt_issuer = "__JWT_ISSUER__"
+jwt_audience = ["__JWT_AUDIENCE__"]
+# Present only in the patched lore-server build this project releases: the
+# service credential lore-server presents to the sidecar's RebacApi
+# (CreateResource / DeleteResource) when a repository is created, instead of
+# forwarding the calling user's token for that hop. Must equal the sidecar's
+# REBAC_SERVICE_TOKEN.
+rebac_service_token = "__REBAC_SERVICE_TOKEN__"
+
+[server.auth.jwk]
+# Where lore-server fetches the sidecar's public signing keys. Container
+# address, so it does not depend on which host ports the demo was started on.
+endpoint = "http://authz:8080/.well-known/jwks.json"
+
+[environment.endpoint]
+# Needs the scheme prefix; container-internal address of the sidecar's gRPC
+# listener.
+auth_url = "http://authz:8443"

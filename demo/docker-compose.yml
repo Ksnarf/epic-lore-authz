@@ -1,0 +1,267 @@
+# epic-lore-authz DEMO stack.
+#
+# EVERY credential in this file is a committed, deliberately non-secret dev
+# value, and each one says so in its own text. Nothing here is a real secret,
+# nothing here was ever used anywhere else, and no value in this directory may
+# be copied into a real deployment. See demo/README.md, "What this is NOT".
+#
+#   start        docker compose up -d --build
+#   prove it     docker compose exec -T tools sh /scripts/verify.sh
+#   tear down    docker compose down -v
+#
+# HOST PORTS ARE ALL VARIABLES. If a default collides with something you
+# already run, override it and everything derived from it follows:
+#
+#   DEMO_PANEL_PORT=18081 DEMO_DEX_PORT=15556 DEMO_AUTHZ_HTTP_PORT=18082 \
+#   DEMO_AUTHZ_GRPC_PORT=18443 DEMO_LORE_GRPC_PORT=41437 \
+#   DEMO_LORE_HTTP_PORT=41439 DEMO_POSTGRES_PORT=15432 \
+#   docker compose up -d --build
+#
+# RELEASE PIN. The two binaries come from a published epic-lore-authz release,
+# so this demo runs the same bytes the project ships. Moving to a future
+# release is a one-line change here, plus dropping that release's own
+# SHA256SUMS asset into demo/release/SHA256SUMS (the build verifies the
+# download against it and fails if it does not match).
+name: lore-authz-demo
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      # Demo-only value. This database is created empty on every `up` and
+      # destroyed by `down -v`.
+      POSTGRES_PASSWORD: demo-postgres-password-not-a-real-secret
+      POSTGRES_DB: postgres
+    ports:
+      - "127.0.0.1:${DEMO_POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # Mock identity provider. Its only user is Dex's built-in mock connector
+  # identity, so "logging in" needs no password and no real IdP account.
+  dex:
+    image: ghcr.io/dexidp/dex:v2.44.0
+    environment:
+      # An OIDC issuer must be ONE string that resolves both inside the
+      # containers and in the operator's browser on the host. That is what
+      # host.docker.internal is for. See demo/README.md, "Linux note".
+      DEX_ISSUER: http://host.docker.internal:${DEMO_DEX_PORT:-5556}/dex
+      PANEL_ORIGIN: http://localhost:${DEMO_PANEL_PORT:-8080}
+    volumes:
+      - ./dex/config.yaml.template:/etc/dex/config.yaml.template:ro
+    # Dex does NOT expand environment variables in its config file (it fails
+    # with "can't parse issuer URL"), so the two values that depend on host
+    # ports are substituted here before dex starts.
+    command:
+      - sh
+      - -c
+      - |
+        set -e
+        sed -e "s|__DEX_ISSUER__|$${DEX_ISSUER}|g" \
+            -e "s|__PANEL_ORIGIN__|$${PANEL_ORIGIN}|g" \
+            /etc/dex/config.yaml.template > /tmp/dex-config.yaml
+        exec dex serve /tmp/dex-config.yaml
+    ports:
+      - "${DEMO_DEX_PORT:-5556}:5556"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "wget",
+          "--spider",
+          "-q",
+          "http://127.0.0.1:5556/dex/.well-known/openid-configuration",
+        ]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # The product: this repository's SSO/authorization sidecar.
+  authz:
+    build:
+      context: .
+      dockerfile: Dockerfile.runtime
+      args:
+        RELEASE_TAG: ${LORE_AUTHZ_RELEASE:-v0.2.0}
+    image: lore-authz-demo/runtime:${LORE_AUTHZ_RELEASE:-v0.2.0}
+    # The release artifacts are linux/amd64. On an arm64 host this runs under
+    # emulation rather than failing with an exec-format error.
+    platform: linux/amd64
+    command: ["/usr/local/bin/lore-authz-server"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      dex:
+        condition: service_healthy
+    environment:
+      RUST_LOG: info
+      DATABASE_URL: postgres://postgres:demo-postgres-password-not-a-real-secret@postgres:5432/postgres
+      DB_SCHEMA: loreauth
+      # The `iss` claim this service mints and lore-server verifies. Both
+      # sides read it from here (lore-config/local.toml.template is rendered
+      # from the same value), so they cannot drift apart.
+      JWT_ISSUER: http://localhost:${DEMO_PANEL_PORT:-8080}
+      JWT_AUDIENCE: localhost
+      TOKEN_ENV: dev
+      TOKEN_IDP: local
+      # NO KEY MATERIAL IS SHIPPED WITH THIS DEMO. This path deliberately does
+      # not exist, which makes the service generate an ephemeral P-256 signing
+      # key in memory at startup and log a warning saying so (see
+      # crates/lore-authz-server/src/signing.rs). Every token this stack mints
+      # dies with the container, which is exactly what a demo wants.
+      SIGNING_KEY_SOURCE: file:///no-key-file-here-generate-an-ephemeral-one.pem
+      JWKS_PATH: /.well-known/jwks.json
+      HTTP_LISTEN_ADDR: 0.0.0.0:8080
+      GRPC_LISTEN_ADDR: 0.0.0.0:8443
+      # The origin an operator types into the address bar: the PANEL's origin,
+      # not this container's. It is what the same-origin (CSRF) rule on every
+      # state-changing /admin request compares against.
+      PUBLIC_BASE_URL: http://localhost:${DEMO_PANEL_PORT:-8080}
+      # Demo-only values. A real deployment generates these and stores them
+      # with its other secrets; see docs/configuration.md.
+      ADMIN_API_TOKEN: demo-admin-token-not-a-real-secret
+      REBAC_SERVICE_TOKEN: demo-rebac-service-token-not-a-real-secret
+      OIDC_ISSUER_URL: http://host.docker.internal:${DEMO_DEX_PORT:-5556}/dex
+      OIDC_CLIENT_ID: epic-lore-authz-demo
+      OIDC_CLIENT_SECRET: demo-oidc-client-secret-not-a-real-secret
+      OIDC_REDIRECT_URL: http://localhost:${DEMO_PANEL_PORT:-8080}/oidc/callback
+      OIDC_SCOPES: openid profile email
+      # ON for the demo so the first login creates the mock user's principal
+      # for you. That principal holds NO grants, which is what makes the
+      # deny-then-allow demonstration in scripts/verify.sh real.
+      OIDC_JIT_PROVISIONING: "true"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      # The RAW sidecar, with no proxy in front of it: fail-closed, you present
+      # the admin bearer yourself. verify.sh proves the 401 here.
+      - "${DEMO_AUTHZ_HTTP_PORT:-18080}:8080"
+      - "${DEMO_AUTHZ_GRPC_PORT:-8443}:8443"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "curl",
+          "-fsS",
+          "-o",
+          "/dev/null",
+          "http://127.0.0.1:8080/.well-known/jwks.json",
+        ]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+
+  # Header-injecting reverse proxy in front of the sidecar's HTTP listener.
+  # WHY THIS EXISTS: /admin is gated on an `authorization: Bearer` header, and
+  # a browser cannot be told to send one by typing a URL, so the panel is only
+  # openable behind a proxy that injects it. That is the deployment model
+  # docs/configuration.md documents ("Reaching the panel from a browser"), and
+  # it is also why the same-origin rule exists: once a proxy injects the token,
+  # the credential becomes ambient and every state-changing request has to
+  # prove it came from this service's own origin.
+  panel:
+    image: nginx:1.27-alpine
+    environment:
+      # Injected by the proxy into every /admin request. Demo-only value; it
+      # must match the sidecar's ADMIN_API_TOKEN above.
+      ADMIN_API_TOKEN: demo-admin-token-not-a-real-secret
+      # nginx listens on the same port it is published on, so the URLs this
+      # stack hands out are byte-identical inside and outside the containers.
+      PANEL_PORT: ${DEMO_PANEL_PORT:-8080}
+    depends_on:
+      authz:
+        condition: service_healthy
+    volumes:
+      # The nginx image renders /etc/nginx/templates/*.template with envsubst
+      # at startup, substituting only variables that are actually set in the
+      # environment -- so nginx's own $host and friends survive untouched.
+      - ./panel/default.conf.template:/etc/nginx/templates/default.conf.template:ro
+    ports:
+      - "${DEMO_PANEL_PORT:-8080}:${DEMO_PANEL_PORT:-8080}"
+
+  # Epic's lore-server (a patched build, published by this repo's release
+  # workflow), configured to trust the sidecar.
+  loreserver:
+    build:
+      context: .
+      dockerfile: Dockerfile.runtime
+      args:
+        RELEASE_TAG: ${LORE_AUTHZ_RELEASE:-v0.2.0}
+    image: lore-authz-demo/runtime:${LORE_AUTHZ_RELEASE:-v0.2.0}
+    platform: linux/amd64
+    depends_on:
+      authz:
+        condition: service_healthy
+    environment:
+      RUST_LOG: info
+      # Rendered into the config file below. Must match the sidecar's values.
+      JWT_ISSUER: http://localhost:${DEMO_PANEL_PORT:-8080}
+      JWT_AUDIENCE: localhost
+      REBAC_SERVICE_TOKEN: demo-rebac-service-token-not-a-real-secret
+    # Two things happen here. (1) The config is rendered from a template so the
+    # issuer and the service token live in ONE place (this file) instead of
+    # being duplicated into a committed config file. (2) lore-server's output
+    # is written to a shared volume so scripts/verify.sh can read the startup
+    # line proving lore-server loaded its auth settings, without handing a demo
+    # container the docker socket. `tail -F` mirrors that same file to this
+    # container's stdout so `docker compose logs loreserver` still works, and
+    # `exec` keeps lore-server as PID 1 so it still gets SIGTERM on shutdown.
+    command:
+      - sh
+      - -c
+      - |
+        set -e
+        mkdir -p /run/lore-config
+        sed -e "s|__JWT_ISSUER__|$${JWT_ISSUER}|g" \
+            -e "s|__JWT_AUDIENCE__|$${JWT_AUDIENCE}|g" \
+            -e "s|__REBAC_SERVICE_TOKEN__|$${REBAC_SERVICE_TOKEN}|g" \
+            /lore-config/local.toml.template > /run/lore-config/local.toml
+        : > /startup/loreserver-startup.log
+        ( tail -F /startup/loreserver-startup.log 2>/dev/null & )
+        exec /usr/local/bin/loreserver --config /run/lore-config --env local \
+          >> /startup/loreserver-startup.log 2>&1
+    volumes:
+      - ./lore-config/local.toml.template:/lore-config/local.toml.template:ro
+      - loredata:/data
+      - lorestartup:/startup
+    ports:
+      - "${DEMO_LORE_GRPC_PORT:-41337}:41337/tcp"
+      - "${DEMO_LORE_GRPC_PORT:-41337}:41337/udp"
+      - "${DEMO_LORE_HTTP_PORT:-41339}:41339/tcp"
+
+  # curl + jq + grpcurl on the stack's own network. This is where verify.sh
+  # runs; it publishes no ports and holds no state.
+  tools:
+    build:
+      context: .
+      dockerfile: Dockerfile.tools
+    image: lore-authz-demo/tools:1
+    command: ["sleep", "infinity"]
+    depends_on:
+      authz:
+        condition: service_healthy
+      loreserver:
+        condition: service_started
+    environment:
+      ADMIN_API_TOKEN: demo-admin-token-not-a-real-secret
+      PANEL_ORIGIN: http://localhost:${DEMO_PANEL_PORT:-8080}
+      PANEL_PORT: ${DEMO_PANEL_PORT:-8080}
+    volumes:
+      # The two protos this demo speaks to the sidecar with are the ones this
+      # repository already vendors, reused in place rather than copied. See
+      # proto/vendor/UPSTREAM.md for their provenance.
+      - ../proto/vendor:/protos:ro
+      - ./scripts:/scripts:ro
+      - lorestartup:/startup:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  pgdata:
+  loredata:
+  lorestartup:

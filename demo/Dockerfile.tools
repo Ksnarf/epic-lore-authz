@@ -1,0 +1,41 @@
+# curl + jq + grpcurl, plus the two lore protos this demo needs to talk to
+# lore-server. This image is where scripts/verify.sh runs.
+#
+# PROTOS, and an honest limitation. The two protos the SIDECAR speaks
+# (auth_api.proto, rebac_api.proto) are already vendored in this repository at
+# proto/vendor/ and are bind-mounted straight from there -- no second copy.
+# The protos LORE-SERVER speaks are not part of this repository and are not
+# vendored here, so they are fetched at BUILD time from EpicGames/lore at the
+# same pinned commit proto/vendor/UPSTREAM.md records, and verified against
+# the checksums committed in demo/release/lore-protos.sha256. That means this
+# image build needs network access to github.com; the demo cannot be built
+# fully offline. Neither file is redistributed by this repository.
+FROM fullstorydev/grpcurl:latest AS grpcurl
+
+FROM debian:trixie-slim
+
+# Same commit proto/vendor/UPSTREAM.md pins, and the commit the patched
+# lore-server in the release was built from.
+ARG LORE_PROTO_COMMIT=f205899adf24b13b2d28e5c08d9256ac99c69f0c
+ARG LORE_PROTO_BASE_URL=https://raw.githubusercontent.com/EpicGames/lore
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl jq \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=grpcurl /bin/grpcurl /usr/local/bin/grpcurl
+COPY release/lore-protos.sha256 /tmp/lore-protos.sha256
+
+RUN set -eu; \
+    mkdir -p /loreprotos/lore/repository/v1 /loreprotos/lore/model/v1; \
+    cd /loreprotos; \
+    for proto in lore/repository/v1/repository.proto lore/model/v1/model.proto; do \
+        echo "downloading lore proto ${proto} @ ${LORE_PROTO_COMMIT}"; \
+        curl -fsSL --retry 3 -o "$proto" \
+            "${LORE_PROTO_BASE_URL}/${LORE_PROTO_COMMIT}/lore-proto/proto/${proto}"; \
+    done; \
+    echo "verifying sha256 against the pinned upstream checksums"; \
+    sha256sum -c /tmp/lore-protos.sha256; \
+    rm -f /tmp/lore-protos.sha256
+
+WORKDIR /work

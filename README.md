@@ -54,6 +54,33 @@ several gotchas that fail silently rather than loudly.
   running -- use Postgres/RDS for that. See docs/configuration.md's
   "Choosing a database backend" section.
 
+## Try it: the one-command demo
+
+`demo/` is a complete, self-contained stack you can start in one command and
+then verify for yourself -- this sidecar, a mock identity provider, Postgres,
+`lore-server`, and the reverse proxy the admin panel is meant to sit behind.
+It runs the published release binaries, so what you validate is what the
+project ships.
+
+```sh
+git clone https://github.com/Ksnarf/epic-lore-authz.git
+cd epic-lore-authz/demo
+./demo.sh            # or: .\demo.ps1 on Windows PowerShell
+```
+
+It starts the stack and then runs `demo/scripts/verify.sh`, which prints a
+numbered claim, the raw output that decides it, and a `[PASS]`/`[FAIL]` line
+for each: the JWKS the sidecar generated, `lore-server` reporting auth
+enabled, `401` on an unauthenticated admin request, `403` on a cross-origin
+form POST and `303` on the same-origin one, `CheckUserPermission` denying
+before a grant and allowing after it, and `lore-server` rejecting an
+unauthenticated gRPC call while serving an authorized one.
+
+It is a DEMO, not a deployment: plaintext HTTP, an ephemeral signing key, a
+mock IdP user, and credentials that are all obviously-fake committed values
+(`demo-admin-token-not-a-real-secret` and friends). Read `demo/README.md`
+before drawing any conclusion about production posture.
+
 ## License and attribution
 
 This project is licensed MIT (see `LICENSE`, Copyright (c) 2026 Ksnarf).
@@ -231,6 +258,7 @@ epic-lore-authz/
       migrations/                 Postgres migrations
       migrations_sqlite/          SQLite migrations (kept in step with the above by hand)
       tests/authz_suite/           shared authz test bodies, run against both backends
+  demo/                         one-command runnable demo stack + scripts/verify.sh (see demo/README.md)
   docs/                         architecture, protocol gotchas, open questions, config reference
   .github/workflows/            ci.yml (fmt/build/test/clippy), proto-drift.yml (upstream drift guard),
                                  release.yml (tag push -> both binaries on a GitHub Release)
