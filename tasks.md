@@ -1811,3 +1811,77 @@ FULL `cargo test --workspace`):**
   This is also why the headline test asserts the ABSENCE of the binding
   BEFORE it asserts the status: a status assertion in front would panic first
   and hide whether the row was written, which is the failure that matters.
+
+## RUNNABLE DEMO - `demo/` (2026-08-10)
+
+- [x] A stranger can clone this repository and validate the product for
+  themselves in one command, with no manual preparation. `[verified-e2e]`
+
+`demo/` is a self-contained stack: this project's sidecar, Dex with its
+built-in mock connector, Postgres, the patched `lore-server`, and the
+token-injecting reverse proxy the admin panel is meant to sit behind. Entry
+points are `demo/demo.sh` and `demo/demo.ps1`; both do
+`docker compose up -d --build --wait` and then run
+`demo/scripts/verify.sh` inside the stack's own network.
+
+What had to change to make the working local stack portable:
+
+- **No key material is committed.** `SIGNING_KEY_SOURCE` points at a path
+  that deliberately does not exist, so `signing.rs` generates an ephemeral
+  P-256 key at startup and logs the warning that says so. Confirmed in the
+  running stack's log:
+  `SIGNING_KEY_SOURCE did not resolve to an existing key file; generated an
+  EPHEMERAL DEV signing key instead`.
+- **Every credential is an obviously-fake committed value** whose own text
+  says it is not a secret (`demo-admin-token-not-a-real-secret` and three
+  siblings). The random tokens the local bring-up used were replaced, and
+  `git grep` confirms none of them exist anywhere in the tree.
+- **Binaries come from the published release**, downloaded at image-build
+  time and verified against that release's own `SHA256SUMS` asset, committed
+  verbatim at `demo/release/SHA256SUMS`. The release tag is a build arg
+  (`LORE_AUTHZ_RELEASE`), so a future release is a one-line change plus that
+  file.
+- **Protos are reused, not copied.** `proto/vendor/` is bind-mounted into the
+  tools container. The two `EpicGames/lore` protos that are NOT in this
+  repository are fetched at image-build time at the same pinned commit
+  `proto/vendor/UPSTREAM.md` records, and checksum-verified against
+  `demo/release/lore-protos.sha256`. `demo/README.md` states the resulting
+  limitation plainly: the demo cannot be built with no network access.
+- **Every host port is a variable**, and the token issuer, the OIDC redirect
+  URL, the same-origin rule, Dex's issuer and lore-server's expected issuer
+  all follow from it. Dex's config and lore-server's config are rendered from
+  templates at container start (Dex does not expand environment variables in
+  its own config file; verified, it fails with `can't parse issuer URL`).
+
+**PROOF (a `git clone` of this repository into a temporary directory OUTSIDE
+the repo, images deleted first and rebuilt with `--no-cache`, run on a
+non-default port set so it could not touch anything already running):**
+
+- `docker compose build --no-cache` re-ran both downloads for real:
+  `lore-authz-server-linux-amd64: OK`, `loreserver-linux-amd64: OK`,
+  `lore/repository/v1/repository.proto: OK`, `lore/model/v1/model.proto: OK`.
+  Build exit 0.
+- `demo.ps1` (build + up + verify) end to end: **8 claims passed, 0 failed**,
+  `VERIFICATION PASSED`, exit 0. The eight claims: JWKS with
+  `kid`/`alg: ES256` from the generated key; lore-server reporting auth
+  enabled against this sidecar; `401` unauthenticated on the raw admin port
+  versus `200` with the bearer and `200` through the proxy;
+  `CheckUserPermission` **denied** before the grant; the admin API creating a
+  principal, a resource and listing roles; an identical form POST refused
+  `403` cross-origin and accepted `303` same-origin; `CheckUserPermission`
+  **allowed** after the grant with the same token and the same call; and
+  lore-server answering `Unauthenticated` with no credential while serving
+  `RepositoryCreate`/`RepositoryList` with a token this service minted.
+- One real portability bug was found by that clean run and fixed (commit
+  `5bfad42`): `authz` and `loreserver` both carried the same build block for
+  the same image tag, so `up --build` built both concurrently and one lost
+  the race with
+  `image "docker.io/lore-authz-demo/runtime:v0.2.0": already exists`. It only
+  reproduces on a genuinely cold start, which is exactly the path a stranger
+  takes.
+- Workspace still green in the pinned build image (`docker/Dockerfile.build`):
+  `cargo fmt --all -- --check`, `cargo build --workspace` and
+  `cargo clippy --workspace --all-targets -- -D warnings` all exit 0.
+  `cargo test --workspace` was NOT re-run: this change touches no Rust source
+  (the diff is `demo/`, `README.md` and this file), and the suite's own
+  behaviour is unchanged.
