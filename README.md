@@ -30,22 +30,20 @@ several gotchas that fail silently rather than loudly.
 
 - Not a fork or a patch of `lore-server` or the `lore` CLI. Both are used
   unmodified; this project only implements the server side of a contract
-  they already speak.
+  they already speak. (Upstream `lore-server` does carry an optional patch
+  for `RebacApi` authentication - see the note on the patched `loreserver`
+  binary below.)
 - Not affiliated with or endorsed by Epic Games, Inc.
 - Not a fine-grained permission enforcement layer. `lore-server`'s own
   authorization check only checks repository membership, never a
   permission string (see `docs/protocol-notes.md`). This project does not
   promise enforcement `lore-server` itself does not perform.
-- Not (yet) a finished product. See `tasks.md`.
-  `LookupUserPermissions`, `CheckUserPermission`,
-  `RebacApi::CreateResource`/`DeleteResource`, the auth-session login flow
-  (`StartAuthSession`/`GetAuthSession`/`ExchangeUserTokenForMultiresourceToken`),
-  OIDC login, and the `/admin` provisioning surface are all real,
-  database-backed logic (see `docs/data-model.md`). Still
-  `Status::unimplemented`: `RefreshAuthSession` (not supported upstream
-  either), `VerifyUser`, the API-key and external-token exchanges, and the
-  `GetUserInfo`/`GetUserId`/`GetProviderUserId` lookups. SAML and SCIM are
-  not started.
+- Not finished production software. Key rotation, audit logging, and
+  admin-action attribution remain open (see `tasks.md` Phase 2+).
+  Still `Status::unimplemented`: `RefreshAuthSession` (intentionally
+  dead - not supported upstream), `VerifyUser`, the API-key and
+  external-token exchanges, and the `GetUserInfo`/`GetUserId`/
+  `GetProviderUserId` lookups. SAML and SCIM have not been started.
 - **SQLite is a dev / single-instance convenience, not a production
   multi-replica option.** Two backends are supported, selected at runtime
   from `DATABASE_URL`'s scheme: Postgres (`postgres://`) and SQLite
@@ -192,10 +190,17 @@ https://github.com/Ksnarf/epic-lore-authz/releases/download/<tag>/loreserver-lin
 https://github.com/Ksnarf/epic-lore-authz/releases/download/<tag>/SHA256SUMS
 ```
 
-`loreserver` there is a **patched** build (adds an optional
-`[server.auth] rebac_service_token` -- see that release's notes for exactly
-what it does), not a vanilla upstream `EpicGames/lore` binary. Verify and
-run:
+`loreserver` is a **patched** build of `EpicGames/lore` (NOT vanilla upstream).
+It adds an optional `[server.auth] rebac_service_token` configuration key that
+this sidecar's `RebacApi` requires on the `CreateResource`/`DeleteResource`
+calls that back repository creation and deletion. A stock, unpatched
+`lore-server` binary cannot satisfy this gate and repository operations will
+fail. The patch is branch `feat/rebac-service-token`, commit `4185ed4`
+(based on upstream `f205899adf24b13b2d28e5c08d9256ac99c69f0c`). See
+`docs/open-questions.md` Q6 and Q12, plus the release notes for what the
+setting actually does.
+
+Verify and run:
 
 ```sh
 sha256sum -c SHA256SUMS
@@ -267,5 +272,28 @@ epic-lore-authz/
 
 ## Status
 
-Scaffold only. See `tasks.md` for the phased delivery plan and current
-status of each phase.
+This project implements the OIDC/RBAC authorization server for unmodified
+`EpicGames/lore`. As of this build:
+
+- **Phase 1b (OIDC login + session management + token exchange)** is
+  implemented and tested against real Dex. `StartAuthSession`,
+  `GetAuthSession`, and `ExchangeUserTokenForMultiresourceToken` are
+  production-ready. Token format is byte-compatible with upstream
+  `lore-server` (proven by JWKS and JSON schema compat tests).
+- **Phase 1a (RBAC enforcement)** is implemented and tested against
+  real Postgres (16). `CheckUserPermission` and `LookupUserPermissions`
+  enforce grants correctly, including wildcard expansion and group
+  inheritance. `RebacApi::CreateResource`/`DeleteResource` manage the
+  resources backing repositories.
+- **SAML and SCIM** have not been started.
+- **Key rotation, audit logging, and admin identity attribution** remain
+  open (admin token is shared, no audit log exists).
+
+The Phase 0 exit gate (a real `lore auth login` / `lore push` / `lore pull`
+against unmodified `lore-server` over HTTPS) has not run - see
+`tasks.md` and `docs/protocol-notes.md` #9 for what remains unproven
+client-side (notably TLS, `lore` CLI's own certificate validation and
+HTTPS rewrite).
+
+See `tasks.md` for the complete phased delivery plan, proof criteria per
+phase, and honest gaps.
