@@ -57,6 +57,13 @@ pub struct SessionRow {
     pub status: String,
     pub principal_id: Option<Uuid>,
     pub expires_at_ms: i64,
+    /// Path A IdP groups support (see `docs/configuration.md` and
+    /// `migrations/0003_auth_session_groups.sql`): a login-time snapshot of
+    /// the groups the identity provider reported, set by
+    /// `mark_authenticated` and read back by `crate::login::poll_session`.
+    /// `None` until authenticated, and also `None` after authentication if
+    /// the IdP never emitted the configured claim.
+    pub groups: Option<Vec<String>>,
 }
 
 impl SessionRow {
@@ -74,6 +81,7 @@ struct PgSessionRow {
     status: String,
     principal_id: Option<Uuid>,
     expires_at_ms: i64,
+    groups_json: Option<String>,
 }
 
 /// Same shape, but `principal_id` as the TEXT SQLite stores (see
@@ -89,20 +97,34 @@ struct SqliteSessionRow {
     status: String,
     principal_id: Option<String>,
     expires_at_ms: i64,
+    groups_json: Option<String>,
 }
 
-impl From<PgSessionRow> for SessionRow {
-    fn from(row: PgSessionRow) -> Self {
-        SessionRow {
-            client_state_hash: row.client_state_hash,
-            oidc_state: row.oidc_state,
-            oidc_nonce: row.oidc_nonce,
-            pkce_verifier: row.pkce_verifier,
-            status: row.status,
-            principal_id: row.principal_id,
-            expires_at_ms: row.expires_at_ms,
-        }
+/// `groups_json` is a JSON-encoded array of strings, or NULL -- see
+/// `migrations/0003_auth_session_groups.sql`. A decode failure here means
+/// something wrote the column outside `mark_authenticated`, which is a real
+/// corruption, not a "no groups" case; it is surfaced as an error rather
+/// than silently treated as `None`.
+fn parse_groups_json(raw: Option<String>) -> Result<Option<Vec<String>>, sqlx::Error> {
+    match raw {
+        None => Ok(None),
+        Some(raw) => serde_json::from_str(&raw).map(Some).map_err(|err| {
+            sqlx::Error::Decode(format!("auth_sessions.groups_json {raw:?}: {err}").into())
+        }),
     }
+}
+
+fn pg_row_into_session(row: PgSessionRow) -> Result<SessionRow, sqlx::Error> {
+    Ok(SessionRow {
+        client_state_hash: row.client_state_hash,
+        oidc_state: row.oidc_state,
+        oidc_nonce: row.oidc_nonce,
+        pkce_verifier: row.pkce_verifier,
+        status: row.status,
+        principal_id: row.principal_id,
+        expires_at_ms: row.expires_at_ms,
+        groups: parse_groups_json(row.groups_json)?,
+    })
 }
 
 fn sqlite_row_into_session(row: SqliteSessionRow) -> Result<SessionRow, sqlx::Error> {
@@ -120,11 +142,12 @@ fn sqlite_row_into_session(row: SqliteSessionRow) -> Result<SessionRow, sqlx::Er
         status: row.status,
         principal_id,
         expires_at_ms: row.expires_at_ms,
+        groups: parse_groups_json(row.groups_json)?,
     })
 }
 
 const SELECT_COLUMNS: &str = "client_state_hash, oidc_state, oidc_nonce, pkce_verifier, status, \
-                              principal_id, expires_at_ms";
+                              principal_id, expires_at_ms, groups_json";
 
 pub async fn insert(db: &Db, session: &NewSession) -> Result<(), sqlx::Error> {
     match db {
@@ -186,7 +209,7 @@ async fn find_by(db: &Db, column: &str, value: &str) -> Result<Option<SessionRow
             .bind(value)
             .fetch_optional(&handle.pool)
             .await?;
-            Ok(row.map(Into::into))
+            row.map(pg_row_into_session).transpose()
         }
         Db::Sqlite(handle) => {
             let row: Option<SqliteSessionRow> = sqlx::query_as(&format!(
@@ -228,35 +251,47 @@ pub async fn find_by_oidc_state(
     find_by(db, "oidc_state", oidc_state).await
 }
 
-/// `pending` -> `authenticated`, binding the session to `principal_id`.
+/// `pending` -> `authenticated`, binding the session to `principal_id` and
+/// to this login's groups snapshot.
 ///
 /// Returns whether the transition actually happened. It does NOT happen if
 /// the session is already authenticated (a replayed IdP callback), already
 /// consumed, or expired -- all three are ordinary, expected outcomes of a
 /// hostile or a merely slow browser, not errors. The caller decides what to
 /// show; this function's job is to make the transition atomic.
+///
+/// `groups_json` is the already-extracted-and-filtered groups claim
+/// (`crate::oidc::extract_groups`), pre-encoded as a JSON array of strings
+/// by the caller (`crate::oidc_login::complete_callback`). `None` means the
+/// IdP did not emit the configured claim this login -- a normal outcome,
+/// refreshed on every login rather than carried over from a previous one.
 pub async fn mark_authenticated(
     db: &Db,
     oidc_state: &str,
     principal_id: Uuid,
+    groups_json: Option<&str>,
     now_ms: i64,
 ) -> Result<bool, sqlx::Error> {
     let rows = match db {
         Db::Postgres(handle) => sqlx::query(
-            "UPDATE auth_sessions SET status = 'authenticated', principal_id = $1 \
-                 WHERE oidc_state = $2 AND status = 'pending' AND expires_at_ms > $3",
+            "UPDATE auth_sessions SET status = 'authenticated', principal_id = $1, \
+                 groups_json = $2 \
+                 WHERE oidc_state = $3 AND status = 'pending' AND expires_at_ms > $4",
         )
         .bind(principal_id)
+        .bind(groups_json)
         .bind(oidc_state)
         .bind(now_ms)
         .execute(&handle.pool)
         .await?
         .rows_affected(),
         Db::Sqlite(handle) => sqlx::query(
-            "UPDATE auth_sessions SET status = 'authenticated', principal_id = ? \
+            "UPDATE auth_sessions SET status = 'authenticated', principal_id = ?, \
+                 groups_json = ? \
                  WHERE oidc_state = ? AND status = 'pending' AND expires_at_ms > ?",
         )
         .bind(principal_id.to_string())
+        .bind(groups_json)
         .bind(oidc_state)
         .bind(now_ms)
         .execute(&handle.pool)

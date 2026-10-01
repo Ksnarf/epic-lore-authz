@@ -48,6 +48,12 @@ pub struct AuthnTokenInput {
     pub name: String,
     pub preferred_username: String,
     pub is_service_account: bool,
+    /// IdP groups claim (Path A, see `docs/configuration.md`), already
+    /// extracted and filtered by `crate::oidc::extract_groups`. `None` means
+    /// the IdP did not emit the configured claim, or every group was
+    /// filtered out -- never an error, and never distinguished on the wire
+    /// from "groups were never configured at all".
+    pub groups: Option<Vec<String>>,
 }
 
 /// Everything needed to mint an AuthZ token. See the module-level doc
@@ -123,6 +129,7 @@ pub fn mint_authn_token(
         env: token_env.to_string(),
         name: input.name.clone(),
         preferred_username: input.preferred_username.clone(),
+        groups: input.groups.clone(),
         is_service_account: Some(input.is_service_account),
         expires_at,
     };
@@ -235,6 +242,7 @@ mod tests {
                 name: "Test User".to_string(),
                 preferred_username: "testuser".to_string(),
                 is_service_account: false,
+                groups: None,
             },
         )
         .unwrap();
@@ -249,5 +257,43 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&payload_json).unwrap();
         assert!(value.get("resources").is_none());
         assert!(value.get("idp").is_none());
+        // Path A: `groups: None` must not even appear on the wire as a null
+        // -- an IdP that never emits the configured claim must leave the
+        // token byte-identical to one minted before groups existed. See
+        // `AuthnClaims::groups`'s `skip_serializing_if`.
+        assert!(value.get("groups").is_none());
+    }
+
+    /// The other half of the same contract: when groups ARE present, they
+    /// must actually reach the wire and round-trip through a real decode --
+    /// not merely be accepted by the struct literal above.
+    #[test]
+    fn authn_token_carries_groups_when_present() {
+        let store = store();
+        let signed = mint_authn_token(
+            store.active(),
+            "https://authz.example.com",
+            &["lore.example.com".to_string()],
+            "dev",
+            36000,
+            &AuthnTokenInput {
+                user_id: "user-1".to_string(),
+                name: "Test User".to_string(),
+                preferred_username: "testuser".to_string(),
+                is_service_account: false,
+                groups: Some(vec!["lore-dev".to_string(), "lore-ops".to_string()]),
+            },
+        )
+        .unwrap();
+
+        let decoding_key = DecodingKey::from_jwk(&store.active().public_jwk).unwrap();
+        let mut validation = Validation::new(Algorithm::ES256);
+        validation.set_issuer(&["https://authz.example.com"]);
+        validation.set_audience(&["lore.example.com"]);
+        let data = decode::<AuthnClaims>(&signed.token, &decoding_key, &validation).unwrap();
+        assert_eq!(
+            data.claims.groups,
+            Some(vec!["lore-dev".to_string(), "lore-ops".to_string()])
+        );
     }
 }

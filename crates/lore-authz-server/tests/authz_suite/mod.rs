@@ -113,6 +113,10 @@
 //! - `poll_with_a_mismatched_client_state_never_issues_a_token`: the
 //!   `session_code` alone is not enough, and a failed attempt does not
 //!   consume the session out from under its rightful owner.
+//! - `poll_returns_an_authn_token_with_the_sessions_groups_snapshot`: Path A
+//!   IdP groups support (see tasks.md) -- a login's groups snapshot
+//!   survives the full round trip into the minted AuthN token's `groups`
+//!   claim.
 //! - `expired_sessions_are_denied_at_both_transitions`: an expired session
 //!   can be neither authenticated by the callback nor redeemed by a poll.
 //! - `poll_denies_when_the_session_principal_is_not_active`: identity is
@@ -386,6 +390,7 @@ impl Harness {
                 name: display_name.to_string(),
                 preferred_username: display_name.to_string(),
                 is_service_account: false,
+                groups: None,
             },
         )
         .expect("mint AuthN test token")
@@ -436,9 +441,30 @@ impl Harness {
     /// `crate::oidc_login` calls once it has verified an ID token. Returns
     /// whether the transition actually happened.
     async fn complete_login(&self, oidc_state: &str, principal_id: Uuid) -> bool {
-        sessions::mark_authenticated(&self.db, oidc_state, principal_id, login::now_ms())
+        self.complete_login_with_groups(oidc_state, principal_id, None)
             .await
-            .expect("mark_authenticated")
+    }
+
+    /// Same as `complete_login`, but also sets this login's groups snapshot
+    /// (Path A, see tasks.md) -- exactly what `oidc_login::complete_callback`
+    /// does with the groups `OidcProvider::verify_id_token` extracted from
+    /// the ID token. `groups: None` behaves identically to `complete_login`.
+    async fn complete_login_with_groups(
+        &self,
+        oidc_state: &str,
+        principal_id: Uuid,
+        groups: Option<&[&str]>,
+    ) -> bool {
+        let groups_json = groups.map(|g| serde_json::to_string(g).expect("serializes"));
+        sessions::mark_authenticated(
+            &self.db,
+            oidc_state,
+            principal_id,
+            groups_json.as_deref(),
+            login::now_ms(),
+        )
+        .await
+        .expect("mark_authenticated")
     }
 
     /// Polls exactly as the CLI does, through the real gRPC handler.
@@ -1197,6 +1223,44 @@ pub async fn poll_returns_an_authn_token_once_the_browser_leg_completes(backend:
     assert_eq!(token.expires_at, claims.expires_at as i64 * 1000);
     // An AuthN token carries no `resources` at all -- proven structurally by
     // AuthnClaims having no such field, and on the wire by lore_compat.rs.
+    // Path A IdP groups support (see tasks.md): a login whose IdP never
+    // emitted the configured claim must carry no `groups` claim at all --
+    // this is the "feature unused" case the whole design must be
+    // byte-identical for.
+    assert_eq!(
+        claims.groups, None,
+        "a session completed with no groups snapshot must mint no `groups` claim"
+    );
+}
+
+/// Path A IdP groups support, end to end through the real database and the
+/// real `GetAuthSession` RPC: the groups snapshot `oidc_login::
+/// complete_callback` would have written is read back and lands in the
+/// minted AuthN token's `groups` claim, surviving a real signature-verified
+/// decode.
+pub async fn poll_returns_an_authn_token_with_the_sessions_groups_snapshot(backend: Backend) {
+    let h = Harness::new(backend).await;
+    let user = Uuid::new_v4();
+    h.create_user(user, "Grouped User").await;
+
+    let client_state = "client-state-groups";
+    let started = h.start_login(client_state).await;
+    assert!(
+        h.complete_login_with_groups(&started.oidc_state, user, Some(&["lore-dev", "lore-ops"]),)
+            .await
+    );
+
+    let token = h
+        .poll(&started.session_code, client_state)
+        .await
+        .expect("an authenticated session must issue a token on the next poll");
+
+    let claims = decode_authn_claims(&h, &token.user_token).claims;
+    assert_eq!(
+        claims.groups,
+        Some(vec!["lore-dev".to_string(), "lore-ops".to_string()]),
+        "the session's groups snapshot must reach the minted AuthN token's `groups` claim"
+    );
 }
 
 /// A session_code is SINGLE USE. The CLI polls every 5 seconds, so a replay

@@ -314,6 +314,11 @@ pub async fn poll_session(
             name: principal.display_name.clone(),
             preferred_username: principal.preferred_username.clone(),
             is_service_account: principal.is_service_account,
+            // Path A IdP groups support: this login's groups snapshot,
+            // captured by the OIDC callback (crate::oidc_login::
+            // complete_callback) and read back off the session row here --
+            // see migrations/0003_auth_session_groups.sql.
+            groups: session.groups.clone(),
         },
     )
     .map_err(|err| {

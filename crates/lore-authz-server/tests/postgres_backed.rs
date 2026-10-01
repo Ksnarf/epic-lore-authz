@@ -138,6 +138,12 @@ async fn poll_returns_an_authn_token_once_the_browser_leg_completes() {
 }
 
 #[tokio::test]
+async fn poll_returns_an_authn_token_with_the_sessions_groups_snapshot() {
+    authz_suite::poll_returns_an_authn_token_with_the_sessions_groups_snapshot(Backend::Postgres)
+        .await
+}
+
+#[tokio::test]
 async fn poll_is_single_use_and_never_reissues() {
     authz_suite::poll_is_single_use_and_never_reissues(Backend::Postgres).await
 }

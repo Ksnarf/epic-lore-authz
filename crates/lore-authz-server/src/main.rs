@@ -177,6 +177,8 @@ async fn main() -> anyhow::Result<()> {
                 client_secret: client_secret.to_string(),
                 redirect_url: redirect_url.to_string(),
                 scopes: config.oidc_scopes.clone(),
+                groups_claim: config.oidc_groups_claim.clone(),
+                groups_filter: config.oidc_groups_filter.clone(),
             })
             .context("building the OIDC provider (OIDC_* settings)")?;
             info!(

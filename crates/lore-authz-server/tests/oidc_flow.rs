@@ -110,6 +110,8 @@ fn provider() -> Arc<OidcProvider> {
             client_secret: env_or_panic("TEST_OIDC_CLIENT_SECRET"),
             redirect_url: env_or_panic("TEST_OIDC_REDIRECT_URL"),
             scopes: "openid profile email".to_string(),
+            groups_claim: "groups".to_string(),
+            groups_filter: None,
         })
         .expect("a fully configured test provider"),
     )

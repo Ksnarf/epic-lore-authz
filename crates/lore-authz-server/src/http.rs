@@ -379,6 +379,8 @@ mod tests {
             client_secret: "secret".to_string(),
             redirect_url: "https://authz.example.com/oidc/callback".to_string(),
             scopes: "openid".to_string(),
+            groups_claim: "groups".to_string(),
+            groups_filter: None,
         })
         .unwrap();
 
@@ -435,6 +437,8 @@ mod tests {
             client_secret: "secret".to_string(),
             redirect_url: "https://authz.example.com/oidc/callback".to_string(),
             scopes: "openid".to_string(),
+            groups_claim: "groups".to_string(),
+            groups_filter: None,
         })
         .unwrap();
 

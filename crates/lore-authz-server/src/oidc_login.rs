@@ -233,7 +233,17 @@ pub async fn complete_callback(
         return Ok(CallbackOutcome::Invalid);
     };
 
-    if !sessions::mark_authenticated(db, state, principal_id, now)
+    // Path A IdP groups support (see tasks.md, docs/configuration.md): a
+    // login-time snapshot, re-captured on every login. `identity.groups` was
+    // already extracted and filtered by `OidcProvider::verify_id_token`
+    // (`crate::oidc::extract_groups`); serializing a `Vec<String>` cannot
+    // fail, so `.expect` here documents that rather than threading a
+    // never-taken error path through this function.
+    let groups_json = identity
+        .groups
+        .map(|groups| serde_json::to_string(&groups).expect("Vec<String> always serializes"));
+
+    if !sessions::mark_authenticated(db, state, principal_id, groups_json.as_deref(), now)
         .await
         .map_err(|err| {
             tracing::warn!(error = %err, "completing a login session failed");

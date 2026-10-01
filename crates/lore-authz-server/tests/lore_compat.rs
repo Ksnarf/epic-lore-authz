@@ -196,6 +196,7 @@ fn minted_authn_token_deserializes_into_lores_jwtuserinfo_fallback_shape() {
             name: "Test User".to_string(),
             preferred_username: "testuser".to_string(),
             is_service_account: false,
+            groups: None,
         },
     )
     .expect("minting must succeed");
@@ -203,6 +204,38 @@ fn minted_authn_token_deserializes_into_lores_jwtuserinfo_fallback_shape() {
     let decoding_key = DecodingKey::from_jwk(&store.active().public_jwk).unwrap();
     let decoded = decode::<JWTUserInfo>(&signed.token, &decoding_key, &lore_server_validation())
         .expect("AuthN token must deserialize as lore-server's JWTUserInfo fallback shape");
+    assert_eq!(decoded.claims.user_id, "user-1");
+}
+
+/// Path A (see tasks.md): the `groups` claim is additive. A stock
+/// `lore-server` that has never heard of it must still decode the rest of
+/// the token unharmed -- `JWTUserInfo` has no `#[serde(deny_unknown_fields)]`
+/// and never did, so an unrecognized extra claim is ignored, not fatal.
+#[test]
+fn minted_authn_token_with_groups_still_deserializes_into_lores_jwtuserinfo_fallback_shape() {
+    let store = test_store();
+    let signed = mint_authn_token(
+        store.active(),
+        TEST_ISSUER,
+        &[TEST_AUDIENCE.to_string()],
+        "dev",
+        36000,
+        &AuthnTokenInput {
+            user_id: "user-1".to_string(),
+            name: "Test User".to_string(),
+            preferred_username: "testuser".to_string(),
+            is_service_account: false,
+            groups: Some(vec!["lore-dev".to_string()]),
+        },
+    )
+    .expect("minting must succeed");
+
+    let decoding_key = DecodingKey::from_jwk(&store.active().public_jwk).unwrap();
+    let decoded = decode::<JWTUserInfo>(&signed.token, &decoding_key, &lore_server_validation())
+        .expect(
+            "a token carrying the extra `groups` claim must still decode as JWTUserInfo -- an \
+             unrecognized claim must never be fatal to a stock lore-server",
+        );
     assert_eq!(decoded.claims.user_id, "user-1");
 }
 

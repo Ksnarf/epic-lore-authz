@@ -106,6 +106,14 @@ pub struct AuthnClaims {
     pub env: String,
     pub name: String,
     pub preferred_username: String,
+    /// IdP groups claim (Path A, see `docs/configuration.md`'s OIDC section
+    /// and `crates/lore-authz-server/src/oidc.rs`'s `extract_groups`).
+    /// `skip_serializing_if` so a token minted with no groups is
+    /// byte-identical to one minted before this field existed -- an IdP that
+    /// never emits the configured claim must not change the wire shape of
+    /// every other token.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub groups: Option<Vec<String>>,
     pub is_service_account: Option<bool>,
     #[serde(rename = "exp")]
     pub expires_at: u64,

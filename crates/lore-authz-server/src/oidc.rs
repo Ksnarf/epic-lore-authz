@@ -131,6 +131,15 @@ pub struct OidcConfig {
     pub redirect_url: String,
     /// Space-separated. `openid` is mandatory and is added if absent.
     pub scopes: String,
+    /// Name of the ID-token claim holding the user's groups (Path A IdP
+    /// groups support, see `docs/configuration.md`). `OIDC_GROUPS_CLAIM`,
+    /// default `groups`.
+    pub groups_claim: String,
+    /// Optional prefix filter kept from the groups claim (`OIDC_GROUPS_
+    /// FILTER`). A trailing `*` is accepted and has no additional effect --
+    /// `lore-` and `lore-*` behave identically. `None` keeps every group the
+    /// provider reports. See `extract_groups`.
+    pub groups_filter: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -168,6 +177,12 @@ struct IdTokenClaims {
     name: Option<String>,
     preferred_username: Option<String>,
     email: Option<String>,
+    /// Everything else the provider put in the ID token, captured so the
+    /// CONFIGURABLE groups claim (`OidcConfig::groups_claim`) can be looked
+    /// up by name below -- a static field cannot do that, since the name
+    /// itself is an operator setting, not fixed by this struct.
+    #[serde(flatten)]
+    extra: serde_json::Map<String, serde_json::Value>,
 }
 
 /// What a successfully verified ID token asserts. Nothing here is trusted
@@ -181,6 +196,13 @@ pub struct VerifiedIdentity {
     pub name: Option<String>,
     pub preferred_username: Option<String>,
     pub email: Option<String>,
+    /// Path A IdP groups support (see `docs/configuration.md`): the
+    /// configured groups claim, already filtered by `OIDC_GROUPS_FILTER` if
+    /// set. `None` means the ID token did not carry the configured claim,
+    /// the claim was not a JSON array of strings, or every entry was
+    /// filtered out -- never an error, and login proceeds exactly as it
+    /// would for an IdP that has never heard of groups.
+    pub groups: Option<Vec<String>>,
 }
 
 struct Cached<T> {
@@ -477,11 +499,18 @@ impl OidcProvider {
             return Err(OidcError::IdToken);
         }
 
+        let groups = extract_groups(
+            &claims.extra,
+            &self.config.groups_claim,
+            self.config.groups_filter.as_deref(),
+        );
+
         Ok(VerifiedIdentity {
             subject: claims.sub,
             name: claims.name,
             preferred_username: claims.preferred_username,
             email: claims.email,
+            groups,
         })
     }
 }
@@ -496,6 +525,51 @@ fn normalize_scopes(scopes: &str) -> String {
         parts.insert(0, "openid");
     }
     parts.join(" ")
+}
+
+/// Path A IdP groups support (see `docs/configuration.md`'s OIDC section):
+/// pulls the configured claim out of the ID token's extra claims and applies
+/// the optional prefix filter.
+///
+/// Deliberately never an error. AD-backed IdPs can put hundreds of groups on
+/// a token (the entire reason `OIDC_GROUPS_FILTER` exists -- tokens have a
+/// size limit), and the whole feature is additive: an IdP that has never
+/// heard of `OIDC_GROUPS_CLAIM` must log a user in exactly as it did before
+/// this feature existed, not fail a login over a missing or oddly-shaped
+/// claim.
+///
+/// - Missing claim, or a claim that is not a JSON array -> `None`.
+/// - A JSON array -> every string element is kept; non-string elements
+///   (numbers, objects, nested arrays) are silently dropped rather than
+///   failing the whole claim, since "every element happened to be a string"
+///   is not something this service can enforce on someone else's IdP.
+/// - `filter_prefix`, if set, keeps only groups starting with it. A trailing
+///   `*` is stripped before comparing, so `lore-` and `lore-*` are the same
+///   filter -- operators reasonably write either.
+/// - An empty result (nothing left after the array/filter steps) -> `None`,
+///   identical to "no groups claim at all". This service never emits an
+///   empty-but-present groups claim.
+fn extract_groups(
+    claims: &serde_json::Map<String, serde_json::Value>,
+    claim_name: &str,
+    filter_prefix: Option<&str>,
+) -> Option<Vec<String>> {
+    let array = claims.get(claim_name)?.as_array()?;
+    let mut groups: Vec<String> = array
+        .iter()
+        .filter_map(|value| value.as_str().map(str::to_string))
+        .collect();
+
+    if let Some(prefix) = filter_prefix {
+        let prefix = prefix.trim_end_matches('*');
+        groups.retain(|group| group.starts_with(prefix));
+    }
+
+    if groups.is_empty() {
+        None
+    } else {
+        Some(groups)
+    }
 }
 
 /// Which client-authentication method to use at the token endpoint, taken
@@ -711,6 +785,8 @@ mod tests {
             client_secret: "secret".to_string(),
             redirect_url: "https://authz.example.com/oidc/callback".to_string(),
             scopes: "openid".to_string(),
+            groups_claim: "groups".to_string(),
+            groups_filter: None,
         };
         assert!(OidcProvider::new(base.clone()).is_ok());
         for missing in [
@@ -743,6 +819,8 @@ mod tests {
             client_secret: "secret".to_string(),
             redirect_url: "https://authz.example.com/oidc/callback".to_string(),
             scopes: "profile".to_string(),
+            groups_claim: "groups".to_string(),
+            groups_filter: None,
         })
         .unwrap();
         assert_eq!(provider.issuer(), "https://idp.example.com");
@@ -786,6 +864,8 @@ mod tests {
             client_secret: "secret".to_string(),
             redirect_url: "https://authz.example.com/oidc/callback".to_string(),
             scopes: "openid".to_string(),
+            groups_claim: "groups".to_string(),
+            groups_filter: None,
         })
         .unwrap();
 
@@ -796,6 +876,112 @@ mod tests {
         assert!(
             matches!(err, OidcError::Discovery),
             "expected OidcError::Discovery, got {err:?}"
+        );
+    }
+
+    // --- Path A: OIDC_GROUPS_CLAIM / OIDC_GROUPS_FILTER (see tasks.md and
+    // docs/configuration.md) -------------------------------------------
+
+    fn extra(json: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+        match json {
+            serde_json::Value::Object(map) => map,
+            other => panic!("test fixture must be a JSON object, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn claim_present_as_a_string_array_is_kept_in_order() {
+        let claims = extra(json!({"groups": ["lore-dev", "lore-ops"]}));
+        assert_eq!(
+            extract_groups(&claims, "groups", None),
+            Some(vec!["lore-dev".to_string(), "lore-ops".to_string()])
+        );
+    }
+
+    #[test]
+    fn a_missing_claim_is_none_not_an_error() {
+        let claims = extra(json!({"sub": "user-1"}));
+        assert_eq!(extract_groups(&claims, "groups", None), None);
+    }
+
+    #[test]
+    fn an_empty_claims_map_is_none() {
+        let claims = extra(json!({}));
+        assert_eq!(extract_groups(&claims, "groups", None), None);
+    }
+
+    #[test]
+    fn a_non_array_claim_value_is_none_not_an_error() {
+        for value in [
+            json!("lore-dev"),
+            json!(42),
+            json!(true),
+            json!({"nested": "object"}),
+            serde_json::Value::Null,
+        ] {
+            let claims = extra(json!({"groups": value}));
+            assert_eq!(
+                extract_groups(&claims, "groups", None),
+                None,
+                "a non-array {value:?} must yield None, never an error"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_array_claim_is_none() {
+        let claims = extra(json!({"groups": []}));
+        assert_eq!(extract_groups(&claims, "groups", None), None);
+    }
+
+    #[test]
+    fn non_string_array_elements_are_dropped_not_fatal() {
+        let claims = extra(json!({"groups": ["lore-dev", 1, null, {"x": 1}, "lore-ops"]}));
+        assert_eq!(
+            extract_groups(&claims, "groups", None),
+            Some(vec!["lore-dev".to_string(), "lore-ops".to_string()])
+        );
+    }
+
+    #[test]
+    fn the_claim_name_is_configurable() {
+        let claims = extra(json!({"memberOf": ["lore-dev"], "groups": ["wrong-claim"]}));
+        assert_eq!(
+            extract_groups(&claims, "memberOf", None),
+            Some(vec!["lore-dev".to_string()])
+        );
+    }
+
+    #[test]
+    fn filter_keeps_only_matching_prefix_with_or_without_a_trailing_star() {
+        let claims = extra(json!({
+            "groups": ["lore-dev", "lore-ops", "corp-allstaff", "lore-admin"]
+        }));
+        let expected = Some(vec![
+            "lore-dev".to_string(),
+            "lore-ops".to_string(),
+            "lore-admin".to_string(),
+        ]);
+        assert_eq!(extract_groups(&claims, "groups", Some("lore-")), expected);
+        assert_eq!(
+            extract_groups(&claims, "groups", Some("lore-*")),
+            expected,
+            "a trailing * must behave identically to its absence"
+        );
+    }
+
+    #[test]
+    fn filter_with_no_matches_is_none_not_an_empty_vec_leaking_through() {
+        let claims = extra(json!({"groups": ["corp-allstaff", "corp-finance"]}));
+        assert_eq!(extract_groups(&claims, "groups", Some("lore-")), None);
+    }
+
+    #[test]
+    fn no_filter_keeps_every_group() {
+        let claims = extra(json!({"groups": ["corp-allstaff", "lore-dev"]}));
+        assert_eq!(
+            extract_groups(&claims, "groups", None),
+            Some(vec!["corp-allstaff".to_string(), "lore-dev".to_string()])
         );
     }
 }

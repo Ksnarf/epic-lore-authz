@@ -142,6 +142,32 @@ Users are identified by the provider's `sub` claim, never by email address
 issuer is recorded as the principal's `idp` and becomes the `idp` claim on
 that user's AuthZ tokens.
 
+### IdP groups ("Path A")
+
+| Setting | Value |
+|---|---|
+| `OIDC_GROUPS_CLAIM` | Name of the ID-token claim holding the user's groups. Default `groups`. |
+| `OIDC_GROUPS_FILTER` | Optional prefix filter, e.g. `lore-` keeps only groups starting with `lore-`. A trailing `*` is accepted and has no additional effect -- `lore-` and `lore-*` filter identically. Unset keeps every group the provider reports. |
+
+Some IdPs -- Active Directory-backed ones in particular -- can put hundreds
+of groups on a token, and tokens have a size limit; `OIDC_GROUPS_FILTER`
+exists to keep only the groups this deployment cares about.
+
+Extraction never fails a login. A missing claim, a claim that is not a JSON
+array of strings, or a result that is empty after filtering are all treated
+identically: no groups for that login, exactly as if the IdP had never
+heard of the feature. An IdP that does not emit the configured claim at all
+logs users in exactly as it did before this feature existed -- the minted
+token is byte-identical, because the `groups` claim is omitted entirely
+rather than emitted as `null` or `[]`.
+
+When groups ARE present, they are captured as a login-time snapshot (set
+fresh on every login, never carried over from a previous one) and surfaced
+as a `groups` claim on the minted AuthN ("user") token only -- there is no
+change to the vendored `auth_api.proto`, to AuthZ tokens, or to this
+product's own `groups`/`group_members` admin-managed tables, which remain a
+separate, durable authorization surface untouched by login.
+
 ## The 150-second client login deadline (a client-side limit, documented not worked around)
 
 The lore CLI polls `GetAuthSession` every 5 seconds up to 30 times and then

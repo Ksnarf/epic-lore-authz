@@ -1,0 +1,35 @@
+-- Path A IdP groups support (see tasks.md, docs/configuration.md's OIDC
+-- section): a login-time snapshot of the groups the identity provider
+-- reported for this login, so GetAuthSession's minted AuthN token can carry
+-- a `groups` claim (crates/lore-authz-core/src/claims.rs's
+-- `AuthnClaims::groups`).
+--
+-- Same schema-qualification rule as 0001/0002: this statement is
+-- schema-UNQUALIFIED on purpose, because `Db::connect` points every pooled
+-- connection's search_path at the configured DB_SCHEMA before this runs.
+--
+-- WHY THIS LIVES ON auth_sessions AND NOT ON principals, AND NOT IN THE
+-- EXISTING groups/group_members TABLES:
+--   - `groups`/`group_members` (migrations/0001) are a DIFFERENT, durable
+--     authorization surface: admin-API-managed group membership, used by the
+--     policy engine to resolve role bindings. Login never writes to them,
+--     and this column must not be confused with or synced into them -- an
+--     IdP's groups claim is an identity ASSERTION from a login moment, not
+--     this product's own group membership model.
+--   - It is a SNAPSHOT, refreshed on every login (set by
+--     db::sessions::mark_authenticated, the same statement that transitions
+--     the session to 'authenticated'), not a durable attribute of the
+--     principal -- a principal's IdP group membership can change between
+--     logins, and the next login is exactly when this service re-observes
+--     it. Storing it on `principals` would make it look durable when it is
+--     not.
+--
+-- Stored as a JSON-encoded array of strings (text, not a native array type),
+-- matching this table's existing cross-backend convention: SQLite has no
+-- array column type, and one representation keeps
+-- crates/lore-authz-server/src/db/sessions.rs to a single parsing code path
+-- for both backends. NULL means the identity provider did not emit the
+-- configured claim (OIDC_GROUPS_CLAIM) for this login, or every group was
+-- filtered out by OIDC_GROUPS_FILTER -- both are a normal, successful login,
+-- never an error (see crate::oidc::extract_groups).
+ALTER TABLE auth_sessions ADD COLUMN IF NOT EXISTS groups_json text;

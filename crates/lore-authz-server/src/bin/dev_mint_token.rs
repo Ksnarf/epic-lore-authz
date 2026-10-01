@@ -186,6 +186,7 @@ fn run() -> Result<String, String> {
                     name: "Dev User".to_string(),
                     preferred_username: "devuser".to_string(),
                     is_service_account: false,
+                    groups: None,
                 },
             )
             .map_err(|e| format!("minting authn token: {e}"))?

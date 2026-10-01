@@ -272,6 +272,7 @@ mod tests {
                 name: "Test User".to_string(),
                 preferred_username: "testuser".to_string(),
                 is_service_account: false,
+                groups: None,
             },
         )
         .unwrap();

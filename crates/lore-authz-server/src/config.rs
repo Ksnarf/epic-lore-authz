@@ -104,6 +104,17 @@ pub struct Config {
     /// Space-separated OIDC scopes. `openid` is added if absent (it is
     /// mandatory in an OIDC authorization request).
     pub oidc_scopes: String,
+    /// Name of the ID-token claim holding the user's groups (Path A IdP
+    /// groups support, see `docs/configuration.md`). `OIDC_GROUPS_CLAIM`,
+    /// default `groups`.
+    pub oidc_groups_claim: String,
+    /// Optional prefix filter kept from the groups claim (`OIDC_GROUPS_
+    /// FILTER`), e.g. `lore-` (a trailing `*` is accepted and has no extra
+    /// effect: `lore-*` and `lore-` filter identically). `None` (unset)
+    /// keeps every group the provider reports. Exists because AD-backed
+    /// IdPs can put hundreds of groups on a token and tokens have a size
+    /// limit. See `crate::oidc::extract_groups`.
+    pub oidc_groups_filter: Option<String>,
     /// Create a principal on first login for an identity that has none.
     /// Safe as a default because it creates an IDENTITY, never an
     /// AUTHORIZATION: a just-provisioned principal holds no role bindings,
@@ -179,6 +190,8 @@ impl std::fmt::Debug for Config {
             .field("oidc_client_secret", &redacted(&self.oidc_client_secret))
             .field("oidc_redirect_url", &self.oidc_redirect_url)
             .field("oidc_scopes", &self.oidc_scopes)
+            .field("oidc_groups_claim", &self.oidc_groups_claim)
+            .field("oidc_groups_filter", &self.oidc_groups_filter)
             .field("oidc_jit_provisioning", &self.oidc_jit_provisioning)
             .field("saml_sp_entity_id", &self.saml_sp_entity_id)
             .field("saml_idp_metadata_url", &self.saml_idp_metadata_url)
@@ -298,6 +311,8 @@ impl Config {
             oidc_client_secret: env_var_opt("OIDC_CLIENT_SECRET"),
             oidc_redirect_url,
             oidc_scopes: env_var_or("OIDC_SCOPES", "openid profile email"),
+            oidc_groups_claim: env_var_or("OIDC_GROUPS_CLAIM", "groups"),
+            oidc_groups_filter: env_var_opt("OIDC_GROUPS_FILTER"),
             oidc_jit_provisioning: parse_bool_env("OIDC_JIT_PROVISIONING", true)?,
             saml_sp_entity_id: env_var_opt("SAML_SP_ENTITY_ID"),
             saml_idp_metadata_url: env_var_opt("SAML_IDP_METADATA_URL"),
@@ -399,6 +414,8 @@ mod tests {
             oidc_client_secret: Some(SENTINEL.to_string()),
             oidc_redirect_url: Some("https://authz.example.com/oidc/callback".to_string()),
             oidc_scopes: "openid".to_string(),
+            oidc_groups_claim: "groups".to_string(),
+            oidc_groups_filter: None,
             oidc_jit_provisioning: true,
             saml_sp_entity_id: None,
             saml_idp_metadata_url: None,

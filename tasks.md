@@ -1885,3 +1885,107 @@ non-default port set so it could not touch anything already running):**
   `cargo test --workspace` was NOT re-run: this change touches no Rust source
   (the diff is `demo/`, `README.md` and this file), and the suite's own
   behaviour is unchanged.
+
+## Path A IdP groups support (branch `oidc-groups-claim`, 2026-10-01)
+
+- [x] `OIDC_GROUPS_CLAIM` (default `groups`) and `OIDC_GROUPS_FILTER`
+      (optional prefix filter, trailing `*` accepted and ignored) parsed
+      from the ID token at login and surfaced as a `groups` claim on the
+      minted AuthN ("user") token only -- explicitly out of scope per this
+      task: `proto/vendor/auth_api.proto`, `AuthzClaims`/the token-exchange
+      RPC, SCIM, and the existing `groups`/`group_members` admin-managed
+      tables, all untouched.
+      [verified-e2e] in the pinned build image (`docker/Dockerfile.build`)
+      and against real Postgres + a real Dex OIDC provider (`docker compose
+      -f docker-compose.test.yml run --rm --build tests`):
+      - `crates/lore-authz-server/src/oidc.rs`: `IdTokenClaims` gained
+        `#[serde(flatten)] extra: serde_json::Map<String, serde_json::Value>`
+        (the claim name is an operator setting, not fixed, so a static field
+        cannot capture it); `extract_groups` reads the configured claim out
+        of `extra`, accepts a JSON array of strings, applies the optional
+        prefix filter, and returns `None` -- never an error -- for a missing
+        claim, a non-array value, or an empty result after filtering.
+        `OidcConfig` gained `groups_claim`/`groups_filter`; `VerifiedIdentity`
+        gained `groups: Option<Vec<String>>`, populated by
+        `verify_id_token`. 10 new unit tests
+        (`oidc::tests::claim_present_as_a_string_array_is_kept_in_order`,
+        `a_missing_claim_is_none_not_an_error`, `an_empty_claims_map_is_none`,
+        `a_non_array_claim_value_is_none_not_an_error` (string/number/bool/
+        object/null all checked), `an_empty_array_claim_is_none`,
+        `non_string_array_elements_are_dropped_not_fatal`,
+        `the_claim_name_is_configurable`,
+        `filter_keeps_only_matching_prefix_with_or_without_a_trailing_star`
+        (asserts `lore-` and `lore-*` filter identically),
+        `filter_with_no_matches_is_none_not_an_empty_vec_leaking_through`,
+        `no_filter_keeps_every_group`).
+      - `crates/lore-authz-core/src/claims.rs`: `AuthnClaims` gained
+        `#[serde(skip_serializing_if = "Option::is_none")] groups:
+        Option<Vec<String>>` -- a token minted with no groups is
+        byte-identical to one minted before this field existed. Proven by
+        `minting::tests::authn_token_has_no_resources_field_at_all`
+        (extended to assert the payload has no `groups` key at all when
+        `None`) and the new
+        `minting::tests::authn_token_carries_groups_when_present` (round
+        trips `Some(vec!["lore-dev", "lore-ops"])` through a real
+        signature-verified decode). `AuthzClaims::groups` was already
+        present (unused until now) and is untouched by this pass.
+      - Threaded end to end: `oidc_login::complete_callback` extracts
+        `identity.groups` (already filtered by `verify_id_token`) and passes
+        it to `db::sessions::mark_authenticated`, which now also takes
+        `groups_json: Option<&str>` and writes it in the SAME conditional
+        `UPDATE ... WHERE status = 'pending'` that transitions the session
+        to `authenticated` -- so the groups snapshot and the state
+        transition are atomic. `crate::login::poll_session` reads
+        `session.groups` back and passes it into
+        `AuthnTokenInput::groups`, which `mint_authn_token` copies onto
+        `AuthnClaims::groups`.
+      - Storage: new migration
+        `crates/lore-authz-server/migrations/0003_auth_session_groups.sql`
+        (+ the `migrations_sqlite/` dialect) adds `auth_sessions.groups_json`
+        (nullable `text`, JSON-encoded array of strings) -- a NEW migration
+        file, no existing migration edited. Deliberately NOT a durable
+        attribute on `principals` and NOT a row in `groups`/`group_members`:
+        it is a login-time snapshot, refreshed by `mark_authenticated` on
+        every login, matching the house rule that those two tables stay
+        admin-API-managed. `db::sessions::SessionRow` gained a parsed
+        `groups: Option<Vec<String>>` (both the Postgres and SQLite row
+        converters are now fallible on a corrupt `groups_json`, matching the
+        existing `principal_id` TEXT-on-SQLite precedent).
+      - End-to-end passthrough proven against BOTH backends (not just at the
+        unit level): `tests/authz_suite/mod.rs` gained
+        `complete_login_with_groups` (same helper `oidc_login::
+        complete_callback` would drive, parameterized with a groups
+        snapshot) and a new shared test,
+        `poll_returns_an_authn_token_with_the_sessions_groups_snapshot`,
+        registered in both `tests/postgres_backed.rs` and
+        `tests/sqlite_backed.rs`. The existing happy-path test
+        (`poll_returns_an_authn_token_once_the_browser_leg_completes`) was
+        extended to assert `claims.groups == None` for a login with no
+        groups snapshot -- the "feature unused" case this design must be
+        byte-identical for.
+      - Compat: `tests/lore_compat.rs` gained
+        `minted_authn_token_with_groups_still_deserializes_into_lores_jwtuserinfo_fallback_shape`,
+        proving a stock, unmodified `lore-server` (via the vendored
+        `JWTUserInfo` struct, which has no `#[serde(deny_unknown_fields)]`)
+        still decodes the rest of the token when the extra `groups` claim is
+        present -- the feature is additive and cannot break an IdP-agnostic
+        consumer that has never heard of it.
+      - Docs: `docs/configuration.md`'s OIDC section gained an "IdP groups
+        (Path A)" subsection documenting both env vars, the default, the
+        filter semantics (including the trailing-`*` equivalence), and that
+        groups land only on the AuthN token. `.env.example` gained
+        `OIDC_GROUPS_CLAIM`/`OIDC_GROUPS_FILTER` (names/defaults only, no
+        secret values, matching house convention).
+      - Evidence: `cargo build --workspace` clean; `cargo fmt --all --
+        check` clean; `cargo clippy --workspace --all-targets -- -D
+        warnings` clean, 0 warnings; `cargo test --workspace` via `docker
+        compose -f docker-compose.test.yml run --rm --build tests`: **237
+        passed, 0 failed** (`lore-authz-server` lib: 100, `tests/
+        lore_compat.rs`: 5, `tests/oidc_flow.rs`: 16 against the real Dex
+        container, `tests/postgres_backed.rs`: 58 against real Postgres,
+        `tests/sqlite_backed.rs`: 58 -- the exact same 58 names as
+        postgres_backed, shared bodies). This pass added 10 `extract_groups`
+        unit tests, 1 new minting unit test (plus an extended assertion on
+        an existing one), 1 new compat test, and 1 new shared integration
+        test (run against both backends) to that total; exact pre-change
+        workspace totals were not captured as a baseline for this pass.
