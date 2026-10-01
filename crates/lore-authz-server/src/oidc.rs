@@ -132,9 +132,16 @@ pub struct OidcConfig {
     /// Space-separated. `openid` is mandatory and is added if absent.
     pub scopes: String,
     /// Name of the ID-token claim holding the user's groups (Path A IdP
-    /// groups support, see `docs/configuration.md`). `OIDC_GROUPS_CLAIM`,
-    /// default `groups`.
-    pub groups_claim: String,
+    /// groups support, see `docs/configuration.md`). `OIDC_GROUPS_CLAIM`.
+    ///
+    /// `None` (unset) means groups extraction is OFF, full stop:
+    /// `extract_groups` is never even consulted, regardless of what the
+    /// IdP's ID token actually carries. This is deliberately NOT defaulted
+    /// to `"groups"` -- an upgrading deployment whose IdP already emits a
+    /// claim literally named `groups` (Azure AD, Okta and Keycloak often do)
+    /// must not start minting a `groups` claim on every token with zero
+    /// operator action. See `groups_for` and `docs/configuration.md`.
+    pub groups_claim: Option<String>,
     /// Optional prefix filter kept from the groups claim (`OIDC_GROUPS_
     /// FILTER`). A trailing `*` is accepted and has no additional effect --
     /// `lore-` and `lore-*` behave identically. `None` keeps every group the
@@ -499,9 +506,9 @@ impl OidcProvider {
             return Err(OidcError::IdToken);
         }
 
-        let groups = extract_groups(
+        let groups = groups_for(
             &claims.extra,
-            &self.config.groups_claim,
+            self.config.groups_claim.as_deref(),
             self.config.groups_filter.as_deref(),
         );
 
@@ -527,9 +534,33 @@ fn normalize_scopes(scopes: &str) -> String {
     parts.join(" ")
 }
 
+/// The OPT-IN gate for Path A IdP groups support: `extract_groups` below is
+/// consulted ONLY when `OIDC_GROUPS_CLAIM` is explicitly configured.
+///
+/// This is not an optimization -- it is the whole point of the feature being
+/// opt-in. Several real IdPs (Azure AD, Okta, Keycloak) emit a claim
+/// literally named `groups` out of the box, with no operator configuration
+/// at all. If this service defaulted `groups_claim` to `"groups"`, every
+/// deployment against one of those providers would start minting a `groups`
+/// claim on the next token the moment this service was upgraded, with zero
+/// operator action -- a silent behavior change on upgrade, not a feature an
+/// operator opted into. `groups_claim: None` must therefore mean "do not
+/// even look", not "look for a claim named groups by default": behavior is
+/// byte-identical to before this feature existed regardless of what claims
+/// the ID token actually carries.
+fn groups_for(
+    claims: &serde_json::Map<String, serde_json::Value>,
+    groups_claim: Option<&str>,
+    groups_filter: Option<&str>,
+) -> Option<Vec<String>> {
+    let claim_name = groups_claim?;
+    extract_groups(claims, claim_name, groups_filter)
+}
+
 /// Path A IdP groups support (see `docs/configuration.md`'s OIDC section):
 /// pulls the configured claim out of the ID token's extra claims and applies
-/// the optional prefix filter.
+/// the optional prefix filter. Only ever called once `groups_for` has
+/// confirmed `OIDC_GROUPS_CLAIM` is actually configured.
 ///
 /// Deliberately never an error. AD-backed IdPs can put hundreds of groups on
 /// a token (the entire reason `OIDC_GROUPS_FILTER` exists -- tokens have a
@@ -785,7 +816,7 @@ mod tests {
             client_secret: "secret".to_string(),
             redirect_url: "https://authz.example.com/oidc/callback".to_string(),
             scopes: "openid".to_string(),
-            groups_claim: "groups".to_string(),
+            groups_claim: None,
             groups_filter: None,
         };
         assert!(OidcProvider::new(base.clone()).is_ok());
@@ -819,7 +850,7 @@ mod tests {
             client_secret: "secret".to_string(),
             redirect_url: "https://authz.example.com/oidc/callback".to_string(),
             scopes: "profile".to_string(),
-            groups_claim: "groups".to_string(),
+            groups_claim: None,
             groups_filter: None,
         })
         .unwrap();
@@ -864,7 +895,7 @@ mod tests {
             client_secret: "secret".to_string(),
             redirect_url: "https://authz.example.com/oidc/callback".to_string(),
             scopes: "openid".to_string(),
-            groups_claim: "groups".to_string(),
+            groups_claim: None,
             groups_filter: None,
         })
         .unwrap();
@@ -982,6 +1013,70 @@ mod tests {
         assert_eq!(
             extract_groups(&claims, "groups", None),
             Some(vec!["corp-allstaff".to_string(), "lore-dev".to_string()])
+        );
+    }
+
+    /// THE opt-in gate, and the whole reason for `groups_for` existing
+    /// separately from `extract_groups`: an ID token that genuinely carries
+    /// a `groups` array -- exactly what Azure AD, Okta and Keycloak emit out
+    /// of the box -- must still yield no groups when `OIDC_GROUPS_CLAIM` is
+    /// unset. An upgrading deployment must see byte-identical behavior,
+    /// never a claim it never asked for appearing on the next token.
+    #[test]
+    fn groups_extraction_is_off_unless_oidc_groups_claim_is_configured() {
+        let claims = extra(json!({"groups": ["lore-dev", "lore-ops"]}));
+        assert_eq!(
+            groups_for(&claims, None, None),
+            None,
+            "an ID token carrying a real groups array must still yield no groups when \
+             OIDC_GROUPS_CLAIM is unset -- extract_groups must never even be consulted"
+        );
+        // Sanity check the other half: once configured, the same claims map
+        // DOES yield groups -- so the test above is proving the gate, not a
+        // broken extractor.
+        assert_eq!(
+            groups_for(&claims, Some("groups"), None),
+            Some(vec!["lore-dev".to_string(), "lore-ops".to_string()])
+        );
+    }
+
+    /// An operator who points `OIDC_GROUPS_CLAIM` at one of the fixed, typed
+    /// ID-token fields (`sub`, `aud`, `nonce`, `name`, `preferred_username`,
+    /// `email`) gets no groups, not an error: `#[serde(flatten)]` on
+    /// `IdTokenClaims::extra` only captures what no other field already
+    /// claimed, so those names never reach `extra` at all. This deserializes
+    /// a REAL `IdTokenClaims` (not a hand-built map) to prove that, not just
+    /// assert it -- see the docs/configuration.md note this test backs.
+    #[test]
+    fn fixed_id_token_fields_are_invisible_to_the_generic_extraction_path() {
+        let claims: IdTokenClaims = serde_json::from_value(json!({
+            "sub": "user-1",
+            "aud": "client-id",
+            "nonce": "the-nonce",
+            "name": "Test User",
+            "preferred_username": "testuser",
+            "email": "user@example.com",
+            "groups": ["lore-dev"]
+        }))
+        .unwrap();
+
+        for fixed_field in ["sub", "aud", "nonce", "name", "preferred_username", "email"] {
+            assert!(
+                !claims.extra.contains_key(fixed_field),
+                "{fixed_field} is a typed IdTokenClaims field and must not leak into `extra`"
+            );
+            assert_eq!(
+                extract_groups(&claims.extra, fixed_field, None),
+                None,
+                "OIDC_GROUPS_CLAIM={fixed_field} must yield no groups, not an error"
+            );
+        }
+        // The real groups claim is still reachable under its own name --
+        // proves `extra` genuinely excludes the typed fields rather than
+        // being empty for some unrelated reason.
+        assert_eq!(
+            extract_groups(&claims.extra, "groups", None),
+            Some(vec!["lore-dev".to_string()])
         );
     }
 }

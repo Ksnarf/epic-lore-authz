@@ -105,9 +105,17 @@ pub struct Config {
     /// mandatory in an OIDC authorization request).
     pub oidc_scopes: String,
     /// Name of the ID-token claim holding the user's groups (Path A IdP
-    /// groups support, see `docs/configuration.md`). `OIDC_GROUPS_CLAIM`,
-    /// default `groups`.
-    pub oidc_groups_claim: String,
+    /// groups support, see `docs/configuration.md`). `OIDC_GROUPS_CLAIM`.
+    ///
+    /// OPT-IN, deliberately with NO default: `None` (unset) means groups
+    /// extraction is OFF, and `crate::oidc::extract_groups` is never
+    /// consulted regardless of what the IdP's ID token carries. Several real
+    /// IdPs (Azure AD, Okta, Keycloak) emit a claim literally named `groups`
+    /// out of the box; defaulting this to `"groups"` would make upgrading
+    /// to this feature a silent behavior change for every such deployment,
+    /// with no operator action at all. An operator who wants the feature
+    /// sets this explicitly -- typically to `groups`.
+    pub oidc_groups_claim: Option<String>,
     /// Optional prefix filter kept from the groups claim (`OIDC_GROUPS_
     /// FILTER`), e.g. `lore-` (a trailing `*` is accepted and has no extra
     /// effect: `lore-*` and `lore-` filter identically). `None` (unset)
@@ -311,7 +319,7 @@ impl Config {
             oidc_client_secret: env_var_opt("OIDC_CLIENT_SECRET"),
             oidc_redirect_url,
             oidc_scopes: env_var_or("OIDC_SCOPES", "openid profile email"),
-            oidc_groups_claim: env_var_or("OIDC_GROUPS_CLAIM", "groups"),
+            oidc_groups_claim: env_var_opt("OIDC_GROUPS_CLAIM"),
             oidc_groups_filter: env_var_opt("OIDC_GROUPS_FILTER"),
             oidc_jit_provisioning: parse_bool_env("OIDC_JIT_PROVISIONING", true)?,
             saml_sp_entity_id: env_var_opt("SAML_SP_ENTITY_ID"),
@@ -414,7 +422,7 @@ mod tests {
             oidc_client_secret: Some(SENTINEL.to_string()),
             oidc_redirect_url: Some("https://authz.example.com/oidc/callback".to_string()),
             oidc_scopes: "openid".to_string(),
-            oidc_groups_claim: "groups".to_string(),
+            oidc_groups_claim: None,
             oidc_groups_filter: None,
             oidc_jit_provisioning: true,
             saml_sp_entity_id: None,

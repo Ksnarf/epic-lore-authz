@@ -1888,13 +1888,14 @@ non-default port set so it could not touch anything already running):**
 
 ## Path A IdP groups support (branch `oidc-groups-claim`, 2026-10-01)
 
-- [x] `OIDC_GROUPS_CLAIM` (default `groups`) and `OIDC_GROUPS_FILTER`
-      (optional prefix filter, trailing `*` accepted and ignored) parsed
-      from the ID token at login and surfaced as a `groups` claim on the
-      minted AuthN ("user") token only -- explicitly out of scope per this
-      task: `proto/vendor/auth_api.proto`, `AuthzClaims`/the token-exchange
-      RPC, SCIM, and the existing `groups`/`group_members` admin-managed
-      tables, all untouched.
+- [x] `OIDC_GROUPS_CLAIM` (OPT-IN, no default -- see the code-review-fix
+      entry below) and `OIDC_GROUPS_FILTER` (optional prefix filter,
+      trailing `*` accepted and ignored) parsed from the ID token at login
+      and surfaced as a `groups` claim on the minted AuthN ("user") token
+      only -- explicitly out of scope per this task:
+      `proto/vendor/auth_api.proto`, `AuthzClaims`/the token-exchange RPC,
+      SCIM, and the existing `groups`/`group_members` admin-managed tables,
+      all untouched.
       [verified-e2e] in the pinned build image (`docker/Dockerfile.build`)
       and against real Postgres + a real Dex OIDC provider (`docker compose
       -f docker-compose.test.yml run --rm --build tests`):
@@ -1989,3 +1990,78 @@ non-default port set so it could not touch anything already running):**
         an existing one), 1 new compat test, and 1 new shared integration
         test (run against both backends) to that total; exact pre-change
         workspace totals were not captured as a baseline for this pass.
+
+## Path A code review fixes (same branch `oidc-groups-claim`, 2026-10-01)
+
+Code review of the above pass came back clean on every hard requirement,
+with two accepted findings. Both fixed on the same branch, no new commit
+on main.
+
+- [x] **Finding 1 (Kilo's decision -- replaces the original spec's default):
+      groups extraction is now OPT-IN, with no default claim name.**
+      Several real IdPs (Azure AD, Okta, Keycloak) emit a claim literally
+      named `groups` on their ID tokens out of the box; defaulting
+      `OIDC_GROUPS_CLAIM` to `"groups"` would have made upgrading to this
+      feature a silent behavior change -- every such deployment would start
+      minting a `groups` claim on the next token the instant this service
+      was upgraded, with zero operator action. Fixed: `OidcConfig::
+      groups_claim` and `Config::oidc_groups_claim` are now
+      `Option<String>` with NO default (`env_var_opt`, not `env_var_or`).
+      `None` means `extract_groups` is never even consulted, regardless of
+      what the ID token actually carries -- behavior is byte-identical to a
+      pre-feature deployment.
+      [verified-e2e] `crates/lore-authz-server/src/oidc.rs` gained a
+      `groups_for(claims, groups_claim: Option<&str>, groups_filter) ->
+      Option<Vec<String>>` gate in front of `extract_groups`
+      (`let claim_name = groups_claim?;` -- a one-line `?` on the `Option`
+      IS the entire opt-in mechanism, so there is no code path that
+      consults `extract_groups` without a configured claim name).
+      `verify_id_token` now calls `groups_for`, not `extract_groups`,
+      directly. New test
+      `oidc::tests::groups_extraction_is_off_unless_oidc_groups_claim_is_configured`
+      proves the exact scenario the finding named: an ID-token claims map
+      that genuinely carries `"groups": ["lore-dev", "lore-ops"]` still
+      yields `None` through `groups_for` when `groups_claim` is `None`, and
+      the same map yields the groups once configured (so the test is
+      proving the gate, not a broken extractor). All seven `OidcConfig`
+      literal construction sites across `oidc.rs`, `http.rs`, `main.rs` and
+      `tests/oidc_flow.rs` updated to the new `Option<String>` shape.
+      `docs/configuration.md`'s "IdP groups (Path A)" section and
+      `.env.example` rewritten to state the opt-in behavior plainly and
+      show the setting commented out by default (names/defaults only, per
+      house convention -- no secret example values).
+- [x] **Finding 2 (doc note): `OIDC_GROUPS_CLAIM` must not be set to one of
+      the fixed, typed ID-token claim names.**
+      `sub`, `aud`, `nonce`, `name`, `preferred_username` and `email` are
+      each a dedicated typed field on `IdTokenClaims`; `#[serde(flatten)]`
+      on `extra` only captures claims no other field already claimed, so
+      pointing `OIDC_GROUPS_CLAIM` at one of those six names finds nothing
+      in `extra` and silently yields no groups -- not an error, just a
+      misconfiguration an operator could spend a while chasing without the
+      note.
+      [verified-e2e] Documented in `docs/configuration.md` (the IdP groups
+      section) and in `.env.example`'s comment block. Backed by a new test
+      that deserializes a REAL `IdTokenClaims` (not a hand-built map) from a
+      JSON object containing all six fixed claims plus a real `groups`
+      array, then asserts each fixed name is absent from `.extra` AND that
+      `extract_groups` pointed at any of them returns `None`, while
+      `extract_groups(&claims.extra, "groups", None)` still returns the
+      real groups -- proving `extra` genuinely excludes the typed fields
+      rather than merely being empty for an unrelated reason:
+      `oidc::tests::fixed_id_token_fields_are_invisible_to_the_generic_extraction_path`.
+- [x] Full proof re-run after both fixes, in the pinned build image
+      (`docker/Dockerfile.build`) and against real Postgres + a real Dex
+      OIDC provider (`docker compose -f docker-compose.test.yml run --rm
+      --build tests`):
+      - `cargo build --workspace`: clean, `Finished dev profile`.
+      - `cargo fmt --all -- --check`: clean, exit 0, no diff.
+      - `cargo clippy --workspace --all-targets -- -D warnings`: clean, 0
+        warnings.
+      - `cargo test --workspace`: **239 passed, 0 failed** -- up from 237
+        before this fix pass (`lore-authz-server` lib: **102** (was 100,
+        +2: the opt-in gate test and the fixed-field-invisibility test),
+        `tests/lore_compat.rs`: 5 (unchanged), `tests/oidc_flow.rs`: 16
+        against the real Dex container (unchanged),
+        `tests/postgres_backed.rs`: 58 against real Postgres (unchanged),
+        `tests/sqlite_backed.rs`: 58, the same 58 names as
+        postgres_backed (unchanged).

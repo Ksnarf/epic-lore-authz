@@ -146,20 +146,40 @@ that user's AuthZ tokens.
 
 | Setting | Value |
 |---|---|
-| `OIDC_GROUPS_CLAIM` | Name of the ID-token claim holding the user's groups. Default `groups`. |
-| `OIDC_GROUPS_FILTER` | Optional prefix filter, e.g. `lore-` keeps only groups starting with `lore-`. A trailing `*` is accepted and has no additional effect -- `lore-` and `lore-*` filter identically. Unset keeps every group the provider reports. |
+| `OIDC_GROUPS_CLAIM` | Name of the ID-token claim holding the user's groups. **Unset by default -- groups extraction is OFF unless you set this.** |
+| `OIDC_GROUPS_FILTER` | Optional prefix filter, e.g. `lore-` keeps only groups starting with `lore-`. A trailing `*` is accepted and has no additional effect -- `lore-` and `lore-*` filter identically. Unset keeps every group the provider reports. Only takes effect once `OIDC_GROUPS_CLAIM` is set. |
+
+**This feature is opt-in, with deliberately no default claim name.** Several
+real identity providers -- Azure AD, Okta, and Keycloak among them -- emit a
+claim literally named `groups` on their ID tokens with no configuration on
+your part. If `OIDC_GROUPS_CLAIM` defaulted to `groups`, upgrading to a
+version of this service that has this feature would start minting a
+`groups` claim on every token the moment you upgraded, for every deployment
+against one of those providers, with zero action on your part. Instead:
+leaving `OIDC_GROUPS_CLAIM` unset means groups extraction never runs at
+all, regardless of what the ID token actually carries -- behavior is
+byte-identical to a deployment that predates this feature. Set
+`OIDC_GROUPS_CLAIM` explicitly to opt in; operators typically set it to
+`groups`, matching what their IdP already emits.
+
+**Do not point `OIDC_GROUPS_CLAIM` at one of the fixed ID-token claims this
+service already parses into typed fields: `sub`, `aud`, `nonce`, `name`,
+`preferred_username`, `email`.** Those names are consumed by this service's
+own ID-token struct and are therefore invisible to the generic claim
+lookup Path A uses -- setting `OIDC_GROUPS_CLAIM` to one of them silently
+yields no groups, not an error.
 
 Some IdPs -- Active Directory-backed ones in particular -- can put hundreds
 of groups on a token, and tokens have a size limit; `OIDC_GROUPS_FILTER`
 exists to keep only the groups this deployment cares about.
 
-Extraction never fails a login. A missing claim, a claim that is not a JSON
-array of strings, or a result that is empty after filtering are all treated
-identically: no groups for that login, exactly as if the IdP had never
-heard of the feature. An IdP that does not emit the configured claim at all
-logs users in exactly as it did before this feature existed -- the minted
-token is byte-identical, because the `groups` claim is omitted entirely
-rather than emitted as `null` or `[]`.
+Once enabled, extraction never fails a login. A missing claim, a claim that
+is not a JSON array of strings, or a result that is empty after filtering
+are all treated identically: no groups for that login, exactly as if the
+feature were disabled. An IdP that does not emit the configured claim at
+all logs users in exactly as it did before this feature existed -- the
+minted token is byte-identical, because the `groups` claim is omitted
+entirely rather than emitted as `null` or `[]`.
 
 When groups ARE present, they are captured as a login-time snapshot (set
 fresh on every login, never carried over from a previous one) and surfaced
